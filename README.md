@@ -1,9 +1,16 @@
-# AI Content Creator Telegram Bot
+# AI Content Creator Telegram Bot (Advanced)
 
-## Setup Instructions
-1. Upload this project to GitHub.
-2. Open [Replit](https://replit.com/) → Create Repl → Import from GitHub.
-3. Add Environment Variables in Secrets:
+## Features
+- Free & Premium Users
+- AI Script + Auto Video
+- Ads Banner
+- Admin Commands
+- Payment via UPI
+
+## Deployment
+1. Upload to GitHub
+2. Connect GitHub → Render
+3. Set Environment Variables:
    - BOT_TOKEN
    - OPENAI_API_KEY
    - ADMIN_ID
@@ -11,4 +18,7 @@
    - BUSINESS_EMAIL
    - SUPPORT_USERNAME
    - UPI_ID
-4. Click Run → Your bot is live 🚀
+4. Build Command:
+   pip install -r requirements.txt
+5. Start Command:
+   python main.py
