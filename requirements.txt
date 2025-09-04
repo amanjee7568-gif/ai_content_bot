@@ -1,0 +1,6 @@
+python-telegram-bot==20.3
+openai==0.27.8
+gTTS
+moviepy
+requests
+flask
