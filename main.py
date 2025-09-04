@@ -278,9 +278,15 @@ def main():
     app_bot.add_handler(CommandHandler("addpremium", addpremium_cmd))
 
     print("🤖 Bot is running...")
-    app_bot.run_polling()
+
+    # ✅ Webhook Setup for Render
+    render_url = os.getenv("WEBHOOK_URL")  # e.g. https://your-app.onrender.com
+    app_bot.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.getenv("PORT", 5000)),
+        url_path=BOT_TOKEN,
+        webhook_url=f"{render_url}/{BOT_TOKEN}"
+    )
 
 if __name__ == "__main__":
-    from threading import Thread
-    Thread(target=lambda: app.run(host="0.0.0.0", port=5000)).start()
     main()
