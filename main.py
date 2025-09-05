@@ -1,157 +1,129 @@
 import os
-import logging
-import requests
+import openai
+import tempfile
+import yt_dlp
+from gtts import gTTS
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-from openai import OpenAI
-from dotenv import load_dotenv
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# Load .env
-load_dotenv()
-
-# Credentials
+# ENV variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-BUSINESS_NAME = os.getenv("BUSINESS_NAME", "My Business")
-CASHFREE_APP_ID = os.getenv("CASHFREE_APP_ID")
-CASHFREE_SECRET_KEY = os.getenv("CASHFREE_SECRET_KEY")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
+PORT = int(os.getenv("PORT", "10000"))
 
-# Logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+openai.api_key = OPENAI_API_KEY
 
-# OpenAI Client
-client = OpenAI(api_key=OPENAI_API_KEY)
+# -------------------------------
+# AI Chat (Text)
+# -------------------------------
+async def ask_ai(prompt: str) -> str:
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4o-mini",  # या gpt-3.5-turbo
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return f"❌ Error: {e}"
 
-# ---------------- HANDLERS ---------------- #
-
+# -------------------------------
+# Handlers
+# -------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"👋 Welcome to {BUSINESS_NAME} Bot!\n\n"
-        f"📌 Commands:\n"
-        f"/ai <text> → AI से चैट\n"
-        f"/yt <url> → YouTube वीडियो डाउनलोड\n"
-        f"/pay <amount> → पेमेंट लिंक बनाएं\n"
-        f"/support <msg> → सपोर्ट टीम से संपर्क\n"
+        "🤖 हेलो! मैं AI Super Bot हूँ.\n\n"
+        "मुझसे टेक्स्ट, वॉइस, इमेज या यूट्यूब वीडियो मांग सकते हो।\n"
+        "Commands:\n"
+        "/ai <msg>\n"
+        "/voice <msg>\n"
+        "/image <desc>\n"
+        "/yt <url>"
     )
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🆘 Help Menu:\n"
-        "/ai <text>\n"
-        "/yt <youtube_url>\n"
-        "/pay <amount>\n"
-        "/support <your message>"
-    )
-
-# ---------- AI CHAT ----------
-async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /ai <your question>")
+# --- AI Text Chat ---
+async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("⚠️ Usage: /ai <your message>")
         return
+    reply = await ask_ai(query)
+    await update.message.reply_text(reply)
 
-    user_msg = " ".join(context.args)
+# --- AI Voice Reply ---
+async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("⚠️ Usage: /voice <your message>")
+        return
+    reply = await ask_ai(query)
+    # convert to audio
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_file:
+        tts = gTTS(reply, lang="hi")
+        tts.save(tmp_file.name)
+        await update.message.reply_voice(voice=open(tmp_file.name, "rb"))
+        os.remove(tmp_file.name)
+
+# --- AI Image Generator ---
+async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    prompt = " ".join(context.args)
+    if not prompt:
+        await update.message.reply_text("⚠️ Usage: /image <description>")
+        return
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        reply = response.choices[0].message.content
-        await update.message.reply_text(reply)
+        response = openai.Image.create(prompt=prompt, size="512x512")
+        image_url = response["data"][0]["url"]
+        await update.message.reply_photo(photo=image_url, caption=f"🖼️ Generated for: {prompt}")
     except Exception as e:
-        await update.message.reply_text("⚠️ AI Error: " + str(e))
+        await update.message.reply_text(f"❌ Error: {e}")
 
-# ---------- YOUTUBE DOWNLOAD ----------
-async def yt_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /yt <youtube_url>")
+# --- YouTube Downloader ---
+async def yt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = " ".join(context.args)
+    if not url:
+        await update.message.reply_text("⚠️ Usage: /yt <youtube_url>")
         return
-
-    url = context.args[0]
-    try:
-        api = f"https://yt1sapi.vercel.app/api?url={url}"
-        res = requests.get(api).json()
-        video_url = res.get("download_url")
-
-        if video_url:
-            await update.message.reply_video(video_url, caption="🎬 Here's your video")
-        else:
-            await update.message.reply_text("⚠️ Download failed, try another link.")
-    except Exception as e:
-        await update.message.reply_text("⚠️ Error: " + str(e))
-
-# ---------- PAYMENT ----------
-async def create_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /pay <amount>")
-        return
-
-    amount = context.args[0]
-    try:
-        payment_url = f"https://payments.cashfree.com/{CASHFREE_APP_ID}?amount={amount}"
-        await update.message.reply_text(f"💳 Pay here securely: {payment_url}")
-    except Exception as e:
-        await update.message.reply_text("⚠️ Payment error: " + str(e))
-
-# ---------- SUPPORT ----------
-async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /support <your message>")
-        return
-
-    user = update.message.from_user
-    user_msg = " ".join(context.args)
-
-    msg = (
-        f"📩 Support Request:\n"
-        f"👤 User: @{user.username or 'N/A'}\n"
-        f"🆔 ID: {user.id}\n"
-        f"💬 Message: {user_msg}"
-    )
+    await update.message.reply_text("📥 Downloading video... please wait.")
 
     try:
-        await context.bot.send_message(ADMIN_ID, msg)
-        await update.message.reply_text("✅ आपका मैसेज एडमिन तक भेज दिया गया है।")
+        ydl_opts = {
+            "format": "mp4",
+            "outtmpl": "/tmp/video.%(ext)s",
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            file_path = ydl.prepare_filename(info)
+
+        await update.message.reply_video(video=open(file_path, "rb"))
+        os.remove(file_path)
     except Exception as e:
-        await update.message.reply_text("⚠️ Support error: " + str(e))
+        await update.message.reply_text(f"❌ Error: {e}")
 
-# ---------- FALLBACK ----------
-async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❓ Unknown command. Type /help for commands.")
+# --- General Text Messages ---
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_msg = update.message.text
+    reply = await ask_ai(user_msg)
+    await update.message.reply_text(reply)
 
-# ---------------- MAIN APP ---------------- #
+# -------------------------------
+# Main
+# -------------------------------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Commands
+    # Handlers
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("ai", ai_chat))
-    app.add_handler(CommandHandler("yt", yt_download))
-    app.add_handler(CommandHandler("pay", create_payment))
-    app.add_handler(CommandHandler("support", support))
+    app.add_handler(CommandHandler("ai", ai_command))
+    app.add_handler(CommandHandler("voice", voice_command))
+    app.add_handler(CommandHandler("image", image_command))
+    app.add_handler(CommandHandler("yt", yt_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Fallback
-    app.add_handler(MessageHandler(filters.COMMAND, fallback))
-
-    # Render Webhook
-    port = int(os.environ.get("PORT", 10000))
+    # Webhook mode for Render
     app.run_webhook(
         listen="0.0.0.0",
-        port=port,
-        url_path=BOT_TOKEN,
-        webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
+        port=PORT,
+        webhook_url=f"{RENDER_URL}/{BOT_TOKEN}"
     )
 
 if __name__ == "__main__":
