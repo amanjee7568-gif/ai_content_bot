@@ -1,6 +1,6 @@
-python-telegram-bot[rate-limiter,job-queue]==21.6
+python-telegram-bot[job-queue,rate-limiter]==21.6
+APScheduler==3.10.4
 Flask==3.1.2
-APScheduler==3.11.0
 yt-dlp==2025.9.5
 moviepy==2.2.1
 gTTS==2.5.4
