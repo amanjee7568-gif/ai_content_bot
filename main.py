@@ -774,7 +774,6 @@ def build_application():
 # =========================
 # Boot: Run Flask + Telegram
 # =========================
-
 import asyncio
 
 def run_telegram_in_thread():
@@ -782,11 +781,13 @@ def run_telegram_in_thread():
     if application is None:
         log("INFO", "Telegram not configured; skipping bot start.")
         return
+
     def _runner():
         try:
             asyncio.run(application.run_polling(allowed_updates=Update.ALL_TYPES))
         except Exception as e:
             log("ERROR", f"telegram thread crash: {e}")
+
     t = threading.Thread(target=_runner, name="tg-polling", daemon=True)
     t.start()
     log("INFO", "Telegram polling thread started.")
