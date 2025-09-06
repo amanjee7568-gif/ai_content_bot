@@ -1,662 +1,695 @@
-# main.py
-# Telegram AI SuperBot — single-file, polling mode, free-tier friendly
-# Features:
-# - ChatGPT-style chat (/ask), dev agent (/code, /app, /explain, /fix, /tests)
-# - File scaffolds returned as documents
-# - Monetization: treasury points, referrals, sponsors/ads rotation, premium upsell, donations
-# - Hourly heartbeat with APScheduler
-# - Admin: /stats /broadcast /add_sponsor /list_sponsors /del_sponsor /set_premium_link /set_referral_payout
-# - Safe fallbacks for rate limiter & webhook conflicts
-# - SQLite persistence (users, treasury, messages, sponsors, referrals)
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Monster AI Module — Single File (Telegram + Flask + Monetization)
+Author: You
+Python: 3.11+ (PTB v21+)
 
-import os
-import re
-import io
-import json
-import time
-import sqlite3
-import textwrap
-import logging
-from datetime import datetime, timedelta
-from typing import Optional, Tuple
+Features:
+- OpenAI chat + HF fallback
+- Dev Agent (code gen/fix)
+- TTS (gTTS), YT download (yt-dlp)
+- Image gen (OpenAI), placeholder fallback
+- Monetization: ad slots (web), affiliate links, visit earnings, analytics
+- SQLite persistence
+- APScheduler jobs
+- Render/Railway friendly (PORT)
+"""
 
+import os, io, re, json, time, uuid, base64, sqlite3, logging, textwrap, asyncio, datetime as dt
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, Tuple, List
+
+# ---- Third-party
 from dotenv import load_dotenv
-
-# Telegram
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-)
-from telegram.constants import ParseMode
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
-)
-
-# Scheduler
+from flask import Flask, request, jsonify, send_file, make_response, redirect
+from flask import render_template_string
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import httpx
+from gtts import gTTS
 
-# OpenAI (>=1.0)
-from openai import OpenAI
-
-# --------- Bootstrap ----------
-load_dotenv()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
-PREMIUM_LINK = os.getenv("PREMIUM_LINK", "").strip()
-REFERRAL_PAYOUT = float(os.getenv("REFERRAL_PAYOUT", "1.0"))
-WELCOME_BONUS = float(os.getenv("WELCOME_BONUS", "0.5"))
-DB_PATH = os.getenv("DB_PATH", "bot.db")
-
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+# Telegram PTB v21
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram.ext import (
+    Application, ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters
 )
+
+# Optional libs
+try:
+    from openai import OpenAI
+    HAVE_OPENAI = True
+except Exception:
+    HAVE_OPENAI = False
+
+try:
+    import yt_dlp
+    HAVE_YTDLP = True
+except Exception:
+    HAVE_YTDLP = False
+
+# ---- Setup
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
 log = logging.getLogger("EconomyBot")
 
-if not TELEGRAM_TOKEN:
-    raise SystemExit("TELEGRAM_TOKEN missing")
-if not OPENAI_API_KEY:
-    log.warning("OPENAI_API_KEY missing: AI features will be disabled.")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "").strip()
+HF_URL             = os.getenv("HUGGINGFACE_API_URL", "").strip()
+HF_TOKEN           = os.getenv("HUGGINGFACE_API_TOKEN", "").strip()
+BASE_URL           = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
+ADMIN_USER_ID      = int(os.getenv("ADMIN_USER_ID", "0") or 0)
+AFFILIATE_TAG      = os.getenv("AFFILIATE_TAG", "mytag")
+PORT               = int(os.getenv("PORT", "8000"))
 
-# --------- DB ----------
+DB_PATH = os.getenv("DB_PATH", "monster.db")
+
+# ---- DB
 def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
 
-def init_db():
+def ensure_schema():
     con = db()
     cur = con.cursor()
     cur.executescript("""
-    CREATE TABLE IF NOT EXISTS users (
+    PRAGMA journal_mode=WAL;
+
+    CREATE TABLE IF NOT EXISTS users(
         user_id INTEGER PRIMARY KEY,
         username TEXT,
-        first_name TEXT,
-        joined_at TEXT,
-        ref_code TEXT UNIQUE,
-        referred_by TEXT
+        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_seen TIMESTAMP
     );
 
-    CREATE TABLE IF NOT EXISTS treasury (
-        user_id INTEGER PRIMARY KEY,
-        balance REAL DEFAULT 0,
-        total_earned REAL DEFAULT 0,
-        total_spent REAL DEFAULT 0,
-        updated_at TEXT
+    CREATE TABLE IF NOT EXISTS sessions(
+        id TEXT PRIMARY KEY,
+        user_id INTEGER,
+        channel TEXT,           -- 'tg' or 'web'
+        created TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_active TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users(user_id)
     );
 
-    CREATE TABLE IF NOT EXISTS messages (
+    CREATE TABLE IF NOT EXISTS logs(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
-        kind TEXT,
-        content TEXT,
-        created_at TEXT
+        session_id TEXT,
+        kind TEXT,              -- 'chat','code','tts','yt','image','visit','callback'
+        input TEXT,
+        output TEXT,
+        tokens_in INTEGER DEFAULT 0,
+        tokens_out INTEGER DEFAULT 0,
+        ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
-    CREATE TABLE IF NOT EXISTS sponsors (
+    CREATE TABLE IF NOT EXISTS earnings(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT,
-        url TEXT,
-        weight INTEGER DEFAULT 1,
-        active INTEGER DEFAULT 1,
-        created_at TEXT
+        session_id TEXT,
+        source TEXT,            -- 'ad','affiliate','visit','pro'
+        amount_cents INTEGER DEFAULT 0,
+        meta TEXT,
+        ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
-    CREATE TABLE IF NOT EXISTS referrals (
+    CREATE TABLE IF NOT EXISTS affiliates(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        referrer_code TEXT,
-        referee_user_id INTEGER,
-        reward REAL,
-        created_at TEXT
+        raw_url TEXT,
+        tagged_url TEXT,
+        created TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
     con.commit()
     con.close()
 
-def _now():
-    return datetime.utcnow().isoformat()
+ensure_schema()
+log.info("DB ready (schema ensured).")
 
-def get_or_create_user(u) -> Tuple[sqlite3.Row, bool]:
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT * FROM users WHERE user_id=?", (u.id,))
-    row = cur.fetchone()
-    created = False
-    if not row:
-        ref_code = f"R{u.id}"
-        cur.execute(
-            "INSERT INTO users (user_id, username, first_name, joined_at, ref_code) VALUES (?,?,?,?,?)",
-            (u.id, u.username or "", u.first_name or "", _now(), ref_code)
-        )
-        cur.execute(
-            "INSERT INTO treasury (user_id, balance, total_earned, total_spent, updated_at) VALUES (?,?,?,?,?)",
-            (u.id, 0.0, 0.0, 0.0, _now())
-        )
-        con.commit()
-        cur.execute("SELECT * FROM users WHERE user_id=?", (u.id,))
-        row = cur.fetchone()
-        created = True
-    con.close()
-    return row, created
-
-def credit(user_id: int, amt: float, reason: str = ""):
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT balance,total_earned FROM treasury WHERE user_id=?", (user_id,))
-    t = cur.fetchone()
-    if not t:
-        cur.execute("INSERT INTO treasury (user_id,balance,total_earned,total_spent,updated_at) VALUES (?,?,?,?,?)",
-                    (user_id, amt, amt, 0.0, _now()))
-    else:
-        balance = float(t["balance"]) + amt
-        total_earned = float(t["total_earned"]) + amt
-        cur.execute("UPDATE treasury SET balance=?, total_earned=?, updated_at=? WHERE user_id=?",
-                    (balance, total_earned, _now(), user_id))
-    con.commit()
-    con.close()
-    log.info(f"Treasury credit {user_id}: +{amt} | {reason}")
-
-def debit(user_id: int, amt: float, reason: str = "") -> bool:
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT balance,total_spent FROM treasury WHERE user_id=?", (user_id,))
-    t = cur.fetchone()
-    if not t or float(t["balance"]) < amt:
-        con.close(); return False
-    balance = float(t["balance"]) - amt
-    total_spent = float(t["total_spent"]) + amt
-    cur.execute("UPDATE treasury SET balance=?, total_spent=?, updated_at=? WHERE user_id=?",
-                (balance, total_spent, _now(), user_id))
-    con.commit(); con.close()
-    log.info(f"Treasury debit {user_id}: -{amt} | {reason}")
-    return True
-
-def get_balance(user_id: int) -> float:
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT balance FROM treasury WHERE user_id=?", (user_id,))
-    t = cur.fetchone()
-    con.close()
-    return float(t["balance"]) if t else 0.0
-
-def add_message(user_id: int, kind: str, content: str):
-    con = db(); cur = con.cursor()
-    cur.execute("INSERT INTO messages (user_id,kind,content,created_at) VALUES (?,?,?,?)",
-                (user_id, kind, content[:4000], _now()))
-    con.commit(); con.close()
-
-def add_sponsor(title: str, url: str, weight: int = 1):
-    con = db(); cur = con.cursor()
-    cur.execute("INSERT INTO sponsors (title,url,weight,active,created_at) VALUES (?,?,?,?,?)",
-                (title.strip(), url.strip(), max(1, int(weight)), 1, _now()))
-    con.commit(); con.close()
-
-def pick_sponsor() -> Optional[sqlite3.Row]:
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT * FROM sponsors WHERE active=1")
-    rows = cur.fetchall()
-    if not rows:
-        con.close(); return None
-    # weight-based simple picker
-    pool = []
-    for r in rows:
-        pool += [r]*int(r["weight"])
-    chosen = pool[int(time.time()) % len(pool)]
-    con.close()
-    return chosen
-
-def list_sponsors():
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT * FROM sponsors ORDER BY id DESC")
-    rows = cur.fetchall()
-    con.close()
-    return rows
-
-def del_sponsor(sid: int) -> bool:
-    con = db(); cur = con.cursor()
-    cur.execute("DELETE FROM sponsors WHERE id=?", (sid,))
-    ok = cur.rowcount > 0
-    con.commit(); con.close()
-    return ok
-
-# --------- OpenAI ----------
-def get_openai_client() -> Optional[OpenAI]:
-    if not OPENAI_API_KEY:
-        return None
+# ---- OpenAI & HF clients
+client_oa: Optional[OpenAI] = None
+if HAVE_OPENAI and OPENAI_API_KEY:
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
+        client_oa = OpenAI(api_key=OPENAI_API_KEY)
         log.info("OpenAI client initialized.")
-        return client
     except Exception as e:
-        log.error(f"OpenAI init failed: {e}")
-        return None
+        log.warning(f"OpenAI init failed: {e}")
 
-oa_client = get_openai_client()
+HAVE_HF = bool(HF_URL and HF_TOKEN)
 
-async def ai_complete(prompt: str, sys: str = "You are a helpful AI assistant. Be concise, accurate.") -> str:
-    if not oa_client:
-        return "⚠️ OpenAI key not set. Admin needs to configure OPENAI_API_KEY."
-    try:
-        # gpt-4o-mini for speed/cost. You can change to 'o4-mini' or 'gpt-4o' if enabled.
-        resp = oa_client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.4,
-            messages=[
-                {"role":"system","content":sys},
-                {"role":"user","content":prompt}
-            ]
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        log.exception("OpenAI error")
-        return f"❌ OpenAI error: {e}"
+# ---- Utils
+def now_ts() -> str:
+    return dt.datetime.utcnow().isoformat() + "Z"
 
-# --------- Monetization helpers ----------
-def referral_attach_if_any(args_text: str, user_row: sqlite3.Row):
-    # /start R123 or /start ref=R123
-    code = ""
-    m = re.search(r"\b(R\d+)\b", args_text or "")
-    if m:
-        code = m.group(1)
-    m2 = re.search(r"ref=([A-Za-z0-9_]+)", args_text or "")
-    if m2:
-        code = m2.group(1)
-
-    if not code:
-        return None
-
-    # Attach only if not already
+def new_session(user_id: Optional[int], channel: str) -> str:
+    sid = uuid.uuid4().hex
     con = db(); cur = con.cursor()
-    cur.execute("SELECT referred_by FROM users WHERE user_id=?", (user_row["user_id"],))
-    rb = cur.fetchone()
-    if rb and (rb["referred_by"] or "") != "":
-        con.close(); return None
-
-    # Don't allow self-ref
-    if code == user_row["ref_code"]:
-        con.close(); return None
-
-    cur.execute("UPDATE users SET referred_by=? WHERE user_id=?", (code, user_row["user_id"]))
+    cur.execute("INSERT INTO sessions(id,user_id,channel,last_active) VALUES(?,?,?,CURRENT_TIMESTAMP)", (sid, user_id, channel))
     con.commit(); con.close()
-    # reward referrer now
-    reward_referrer(code, user_row["user_id"])
-    return code
+    return sid
 
-def reward_referrer(ref_code: str, new_user_id: int):
-    # Find referrer user_id from ref_code
+def touch_session(session_id: str):
     con = db(); cur = con.cursor()
-    cur.execute("SELECT user_id FROM users WHERE ref_code=?", (ref_code,))
-    r = cur.fetchone()
-    if not r:
-        con.close(); return
-    referrer_id = int(r["user_id"])
-    credit(referrer_id, REFERRAL_PAYOUT, reason=f"Referral reward for {new_user_id}")
-    cur.execute("INSERT INTO referrals (referrer_code, referee_user_id, reward, created_at) VALUES (?,?,?,?)",
-                (ref_code, new_user_id, REFERRAL_PAYOUT, _now()))
+    cur.execute("UPDATE sessions SET last_active=CURRENT_TIMESTAMP WHERE id=?", (session_id,))
     con.commit(); con.close()
 
-# --------- Bot Replies ----------
-WELCOME_TEXT = """\
-👋 *Welcome to SuperBot* — दुनिया का शक्तिशाली AI डेवलपर असिस्टेंट!
+def log_event(user_id: Optional[int], session_id: Optional[str], kind: str, inp: str, out: str, ti=0, to=0):
+    con = db(); cur = con.cursor()
+    cur.execute("INSERT INTO logs(user_id,session_id,kind,input,output,tokens_in,tokens_out) VALUES(?,?,?,?,?,?,?)",
+                (user_id, session_id, kind, inp[:2000], out[:2000], ti, to))
+    con.commit(); con.close()
 
-आप कर सकते हैं:
-• /ask — किसी भी सवाल का instant जवाब
-• /code — code generate/complete (उदा. `/code python make a fastapi hello world`)
-• /app — पूरा app scaffold फाइल के रूप में
-• /explain — code समझाओ
-• /fix — buggy code ठीक करो
-• /tests — unit tests बनाओ
-• /balance — अपनी कमाई/treasury देखो
-• /ads — स्पॉन्सर/ऑफर देखें (visit=earn)
-• /premium — प्रीमियम benefits
+def add_user(user_id: int, username: str = ""):
+    con = db(); cur = con.cursor()
+    cur.execute("INSERT INTO users(user_id,username,first_seen,last_seen) VALUES(?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) "
+                "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, last_seen=CURRENT_TIMESTAMP",
+                (user_id, username))
+    con.commit(); con.close()
 
-💸 Monetization & Rewards
-• Referral: अपना code शेयर करो — हर join पर +₹/points
-• Visits to sponsors: periodic bonus
-• Daily welcome bonus (first time)
+def record_earning(session_id: str, source: str, cents: int, meta: Dict[str, Any]):
+    con = db(); cur = con.cursor()
+    cur.execute("INSERT INTO earnings(session_id,source,amount_cents,meta) VALUES(?,?,?,?)",
+                (session_id, source, cents, json.dumps(meta)[:1000]))
+    con.commit(); con.close()
 
-Admin tools: /stats /broadcast /add_sponsor /list_sponsors /del_sponsor /set_premium_link /set_referral_payout
+def make_affiliate(url: str) -> str:
+    # very basic example: append ?tag=AFFILIATE_TAG
+    sep = "&" if "?" in url else "?"
+    tagged = f"{url}{sep}tag={AFFILIATE_TAG}"
+    con = db(); cur = con.cursor()
+    cur.execute("INSERT INTO affiliates(raw_url,tagged_url) VALUES(?,?)", (url, tagged))
+    con.commit(); con.close()
+    return tagged
+
+# ---- AI Core
+SYSTEM_PROMPT = (
+    "You are Monster, a super-capable AI assistant and developer agent. "
+    "Be concise, accurate, and pragmatic. When asked for code, produce complete runnable snippets. "
+    "If a task requires steps (plan -> code -> tests), output them clearly."
+)
+
+async def ai_chat(prompt: str) -> str:
+    """OpenAI chat with HF fallback."""
+    # Try OpenAI (Responses API style)
+    if client_oa:
+        try:
+            resp = client_oa.responses.create(
+                model="gpt-4o-mini",  # economical; change to your best available
+                input=[{"role":"system","content":SYSTEM_PROMPT},
+                       {"role":"user","content":prompt}],
+                temperature=0.2,
+            )
+            txt = resp.output_text or ""
+            if txt.strip():
+                return txt.strip()
+        except Exception as e:
+            log.warning(f"OpenAI fail: {e}")
+
+    # HuggingFace fallback (simple)
+    if HAVE_HF:
+        try:
+            headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+            payload = {
+                "inputs": f"System: {SYSTEM_PROMPT}\nUser: {prompt}\nAssistant:",
+                "parameters": {"max_new_tokens": 600, "temperature": 0.3},
+                "options": {"wait_for_model": True}
+            }
+            async with httpx.AsyncClient(timeout=60) as s:
+                r = await s.post(HF_URL, headers=headers, json=payload)
+                r.raise_for_status()
+                data = r.json()
+                # HF responses vary by model; try a few shapes
+                if isinstance(data, list) and data:
+                    txt = data[0].get("generated_text","")
+                else:
+                    txt = data.get("generated_text","") if isinstance(data, dict) else ""
+                return (txt or "Sorry, model returned empty.").strip()
+        except Exception as e:
+            log.warning(f"HF fail: {e}")
+
+    return "AI backend is not available right now. Please try again later."
+
+async def dev_agent(task: str) -> str:
+    """Developer agent: plan + code + tests."""
+    prompt = f"""
+Act as a senior software engineer. For the task below:
+1) Brief Plan
+2) Key Files (with paths) and complete code blocks
+3) Quick test instructions
+
+Task:
+{task}
+"""
+    return await ai_chat(prompt)
+
+async def ai_image(prompt: str) -> Tuple[str, Optional[bytes]]:
+    """
+    Returns (message, image_bytes or None).
+    """
+    if client_oa:
+        try:
+            img = client_oa.images.generate(model="gpt-image-1", prompt=prompt, size="1024x1024")
+            b64 = img.data[0].b64_json
+            return ("Image generated with OpenAI.", base64.b64decode(b64))
+        except Exception as e:
+            log.warning(f"img gen fail: {e}")
+    # fallback
+    return ("Image service unavailable; showing placeholder.", None)
+
+def synthesize_tts(text: str) -> bytes:
+    tts = gTTS(text=text, lang="en")
+    buf = io.BytesIO()
+    tts.write_to_fp(buf)
+    buf.seek(0)
+    return buf.read()
+
+def download_youtube(url: str) -> Tuple[str, bytes]:
+    if not HAVE_YTDLP:
+        raise RuntimeError("yt-dlp not installed in this environment.")
+    ydl_opts = {
+        "format": "mp4",
+        "outtmpl": "-",
+        "quiet": True,
+        "noplaylist": True,
+    }
+    # We'll download to buffer by using a file then read; yt-dlp doesn't write to stdout reliably for mp4
+    tmp = f"/tmp/{uuid.uuid4().hex}.mp4"
+    ydl_opts["outtmpl"] = tmp
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+    with open(tmp, "rb") as f:
+        data = f.read()
+    os.remove(tmp)
+    return ("video.mp4", data)
+
+# ---- Flask Web App
+app = Flask(__name__)
+
+BASE_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Monster AI</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://cdn.jsdelivr.net">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.classless.min.css">
+<style>
+  .hero {padding: 1.5rem; border-radius: 16px; background: #111; color:#eee;}
+  .ad-slot{min-height:120px;border:1px dashed #aaa;display:flex;align-items:center;justify-content:center;margin:10px 0;border-radius:12px}
+  .mono{font-family: ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace}
+</style>
+<!-- Google AdSense (placeholder) -->
+<!-- Replace with your client id
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-XXXX" crossorigin="anonymous"></script>
+-->
+</head>
+<body>
+<main class="container">
+  <section class="hero">
+    <h2>Monster AI — Developer Agent + Chat</h2>
+    <p>Visit earns are counted. Ads & affiliate integrated.</p>
+  </section>
+
+  <div class="ad-slot">Ad Slot (header)</div>
+
+  <form id="askform">
+    <label>Ask anything</label>
+    <textarea name="q" id="q" rows="4" placeholder="Ask Monster..." required></textarea>
+    <button type="submit">Ask</button>
+  </form>
+
+  <article>
+    <h4>Response</h4>
+    <pre class="mono" id="resp"></pre>
+  </article>
+
+  <div class="grid">
+    <div>
+      <h5>Dev Agent</h5>
+      <textarea id="devtask" rows="4" placeholder="Build me a Flask API with JWT..."></textarea>
+      <button id="devbtn">Generate</button>
+    </div>
+    <div>
+      <h5>TTS</h5>
+      <textarea id="tts_text" rows="4" placeholder="Text to speak..."></textarea>
+      <button id="tts_btn">Synthesize</button>
+      <div id="tts_out"></div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div>
+      <h5>Image</h5>
+      <input id="img_prompt" placeholder="A cyberpunk city at dawn"/>
+      <button id="img_btn">Generate Image</button>
+      <div id="img_out"></div>
+    </div>
+    <div>
+      <h5>Affiliate</h5>
+      <input id="aff_url" placeholder="https://amazon.in/some-product"/>
+      <button id="aff_btn">Make Affiliate Link</button>
+      <pre class="mono" id="aff_out"></pre>
+    </div>
+  </div>
+
+  <div class="ad-slot">Ad Slot (footer)</div>
+
+  <footer>
+    <small>© Monster AI</small>
+  </footer>
+</main>
+
+<script>
+const sid = localStorage.getItem("monster_sid") || crypto.randomUUID();
+localStorage.setItem("monster_sid", sid);
+
+// Visit earning ping
+fetch("/api/visit?sid="+sid).catch(()=>{});
+
+const q = (id)=>document.getElementById(id);
+
+document.getElementById("askform").addEventListener("submit", async (e)=>{
+  e.preventDefault();
+  const txt = q("q").value.trim();
+  q("resp").textContent = "Thinking...";
+  const r = await fetch("/api/ask", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({sid, q: txt})});
+  const j = await r.json();
+  q("resp").textContent = j.answer || j.error || "No response";
+});
+
+q("devbtn").onclick = async ()=>{
+  const task = q("devtask").value.trim();
+  const r = await fetch("/api/dev", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({sid, task})});
+  const j = await r.json();
+  q("resp").textContent = j.answer || j.error || "No response";
+};
+
+q("tts_btn").onclick = async ()=>{
+  const t = q("tts_text").value.trim();
+  const r = await fetch("/api/tts", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({sid, text: t})});
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  q("tts_out").innerHTML = '<audio controls src="'+url+'"></audio>';
+};
+
+q("img_btn").onclick = async ()=>{
+  const p = q("img_prompt").value.trim();
+  const r = await fetch("/api/image", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({sid, prompt: p})});
+  const ct = r.headers.get("Content-Type");
+  if (ct && ct.startsWith("image/")){
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    q("img_out").innerHTML = '<img style="max-width:100%" src="'+url+'"/>';
+  } else {
+    const j = await r.json();
+    q("img_out").textContent = j.message || "No image";
+  }
+};
+
+q("aff_btn").onclick = async ()=>{
+  const u = q("aff_url").value.trim();
+  const r = await fetch("/api/aff", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({url: u})});
+  const j = await r.json();
+  q("aff_out").textContent = j.tagged_url || j.error || "";
+};
+</script>
+</body>
+</html>
 """
 
-PREMIUM_TEXT = """\
-✨ *Premium Features*
-- Higher rate limits
-- Longer context & faster responses
-- Priority code-gen & file scaffolds
+@app.route("/")
+def home():
+    return render_template_string(BASE_HTML)
 
-{link}
+@app.route("/health")
+def health():
+    return jsonify({"ok": True, "ts": now_ts()})
 
-Alternatively, donate/sponsor us via /ads. Thanks!
-"""
+@app.post("/api/ask")
+async def api_ask():
+    data = request.get_json(force=True, silent=True) or {}
+    sid = data.get("sid") or new_session(None, "web")
+    q = (data.get("q") or "").strip()
+    touch_session(sid)
+    if not q:
+        return jsonify({"error":"empty question"}), 400
+    ans = await ai_chat(q)
+    log_event(None, sid, "chat", q, ans)
+    # Monetization: per-answer earning hook (tiny)
+    record_earning(sid, "pro", cents=1, meta={"reason":"answer"})
+    return jsonify({"answer": ans, "sid": sid})
 
-def sponsor_keyboard():
-    s = pick_sponsor()
-    if not s:
-        return None
-    kb = [[InlineKeyboardButton(f"🔥 {s['title']}", url=s["url"])]]
-    return InlineKeyboardMarkup(kb)
+@app.post("/api/dev")
+async def api_dev():
+    data = request.get_json(force=True, silent=True) or {}
+    sid = data.get("sid") or new_session(None, "web")
+    task = (data.get("task") or "").strip()
+    touch_session(sid)
+    if not task:
+        return jsonify({"error":"empty task"}), 400
+    ans = await dev_agent(task)
+    log_event(None, sid, "code", task, ans)
+    record_earning(sid, "pro", cents=2, meta={"reason":"dev"})
+    return jsonify({"answer": ans})
 
-# --------- Handlers ----------
+@app.post("/api/tts")
+def api_tts():
+    data = request.get_json(force=True, silent=True) or {}
+    sid = data.get("sid") or new_session(None, "web")
+    text = (data.get("text") or "").strip()
+    touch_session(sid)
+    if not text:
+        return jsonify({"error":"empty text"}), 400
+    audio = synthesize_tts(text)
+    log_event(None, sid, "tts", text, "[audio]")
+    record_earning(sid, "pro", cents=1, meta={"reason":"tts"})
+    return send_file(io.BytesIO(audio), mimetype="audio/mpeg", as_attachment=False, download_name="speech.mp3")
+
+@app.post("/api/image")
+async def api_image():
+    data = request.get_json(force=True, silent=True) or {}
+    sid = data.get("sid") or new_session(None, "web")
+    prompt = (data.get("prompt") or "").strip()
+    touch_session(sid)
+    if not prompt:
+        return jsonify({"error":"empty prompt"}), 400
+    msg, img = await ai_image(prompt)
+    if img:
+        log_event(None, sid, "image", prompt, "[image]")
+        record_earning(sid, "pro", cents=2, meta={"reason":"image"})
+        return send_file(io.BytesIO(img), mimetype="image/png", as_attachment=False, download_name="image.png")
+    else:
+        log_event(None, sid, "image", prompt, msg)
+        return jsonify({"message": msg})
+
+@app.post("/api/aff")
+def api_aff():
+    data = request.get_json(force=True, silent=True) or {}
+    url = (data.get("url") or "").strip()
+    if not url:
+        return jsonify({"error":"empty url"}), 400
+    tagged = make_affiliate(url)
+    return jsonify({"tagged_url": tagged})
+
+@app.get("/api/visit")
+def api_visit():
+    sid = request.args.get("sid") or new_session(None, "web")
+    touch_session(sid)
+    log_event(None, sid, "visit", "landing", "ok")
+    # Visit earning (tiny)
+    record_earning(sid, "visit", cents=1, meta={"path": request.path, "ua": request.headers.get("User-Agent","")[:120]})
+    return jsonify({"ok": True, "sid": sid})
+
+# ---- Telegram Bot
+
+RATE_LIMITER = None
+try:
+    from telegram.ext import AIORateLimiter
+    RATE_LIMITER = AIORateLimiter(max_retries=3)
+    log.info("Rate limiter enabled.")
+except Exception:
+    log.warning("Rate limiter not available. Proceeding without it.")
+
+def kb_main():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧠 Dev Agent", callback_data="menu_dev"),
+         InlineKeyboardButton("🖼️ Image", callback_data="menu_img")],
+        [InlineKeyboardButton("🔊 TTS", callback_data="menu_tts"),
+         InlineKeyboardButton("⬇️ YT", callback_data="menu_yt")]
+    ])
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    row, created = get_or_create_user(u)
-    args_text = ""
-    if context.args:
-        args_text = " ".join(context.args)
-    attached = referral_attach_if_any(args_text, row)
+    add_user(u.id, u.username or "")
+    sid = new_session(u.id, "tg")
+    text = ("Monster AI ready!\n"
+            "Use /ask <question>\n"
+            "/dev <task>\n"
+            "/tts <text>\n"
+            "/yt <url>\n"
+            "/img <prompt>\n")
+    await update.effective_chat.send_message(text, reply_markup=kb_main())
+    log_event(u.id, sid, "visit", "start", "ok")
+    record_earning(sid, "visit", 1, {"via":"tg_start"})
 
-    if created:
-        # welcome bonus
-        credit(u.id, WELCOME_BONUS, "Welcome bonus")
-
-    add_message(u.id, "cmd", "/start " + args_text)
-
-    kb = [
-        [InlineKeyboardButton("Ask AI", callback_data="action:ask"),
-         InlineKeyboardButton("Generate Code", callback_data="action:code")],
-        [InlineKeyboardButton("View Sponsors", callback_data="action:ads"),
-         InlineKeyboardButton("Check Balance", callback_data="action:bal")]
-    ]
-    if row["ref_code"]:
-        kb.append([InlineKeyboardButton("Invite & Earn", url=f"https://t.me/{(await context.bot.get_me()).username}?start={row['ref_code']}")])
-
-    await update.message.reply_markdown(
-        WELCOME_TEXT + (f"\n🔗 Attached referral: *{attached}*" if attached else ""),
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_markdown(WELCOME_TEXT)
-
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    bal = get_balance(u.id)
-    row, _ = get_or_create_user(u)
-    await update.message.reply_text(f"💰 Balance: {bal:.2f}\nReferral code: {row['ref_code']}")
-
-async def premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    link = PREMIUM_LINK or "👉 Admin ने premium link set नहीं किया है। (/set_premium_link)"
-    await update.message.reply_markdown(PREMIUM_TEXT.format(link=link))
-
-async def ads(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = sponsor_keyboard()
-    if not keyboard:
-        await update.message.reply_text("No active sponsors yet. Ask admin to add via /add_sponsor")
+async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user; add_user(u.id, u.username or "")
+    sid = new_session(u.id, "tg")
+    q = " ".join(context.args) if context.args else (update.message.text or "").replace("/ask","",1).strip()
+    if not q:
+        await update.message.reply_text("Send like: /ask how to center a div?")
         return
-    await update.message.reply_text("🎯 *Sponsored Offer* — visit to support us:", parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+    await update.message.reply_text("Thinking…")
+    ans = await ai_chat(q)
+    await update.message.reply_text(ans[:4000])
+    log_event(u.id, sid, "chat", q, ans)
 
-async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    q = " ".join(context.args) if context.args else (update.message.text or "")
-    if not q.strip():
-        await update.message.reply_text("Usage: /ask your question")
+async def dev_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user; add_user(u.id, u.username or "")
+    sid = new_session(u.id, "tg")
+    task = " ".join(context.args) if context.args else (update.message.text or "").replace("/dev","",1).strip()
+    if not task:
+        await update.message.reply_text("Send like: /dev build a todo app with FastAPI and SQLite")
         return
-    add_message(u.id, "ask", q)
-    sponsor = sponsor_keyboard()
-    res = await ai_complete(q)
-    credit(u.id, 0.02, "Engagement reward")
-    await update.message.reply_text(res, reply_markup=sponsor)
+    await update.message.reply_text("Engineering…")
+    ans = await dev_agent(task)
+    await update.message.reply_text(ans[:4000], disable_web_page_preview=True)
+    log_event(u.id, sid, "code", task, ans)
 
-# ---- Dev Agent Tools ----
-DEV_SYSTEM = """You are an expert software engineer and architect. 
-Respond with clear, production-grade solutions, include reasoning briefly, and give runnable code where requested.
-Prefer minimal dependencies. Be safe and avoid secrets."""
-
-async def code_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    prompt = " ".join(context.args) if context.args else ""
-    if not prompt:
-        await update.message.reply_text("Example:\n/code python make a FastAPI hello world with /health route")
-        return
-    add_message(u.id, "code", prompt)
-    res = await ai_complete(f"Generate code as requested.\n\nRequest:\n{prompt}", DEV_SYSTEM)
-    credit(u.id, 0.05, "Code-gen reward")
-    await update.message.reply_markdown_v2(escape_md(res))
-
-async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    code = extract_code_from_text(update.message.text or "")
-    if not code:
-        await update.message.reply_text("Send with code block or paste your code after /explain")
-        return
-    add_message(u.id, "explain", "len="+str(len(code)))
-    res = await ai_complete(f"Explain this code step by step and suggest improvements:\n\n{code}", DEV_SYSTEM)
-    credit(u.id, 0.03, "Explain reward")
-    await update.message.reply_text(res)
-
-async def fix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    code = extract_code_from_text(update.message.text or "")
-    if not code:
-        await update.message.reply_text("Send buggy code after /fix")
-        return
-    add_message(u.id, "fix", "len="+str(len(code)))
-    res = await ai_complete(f"Fix the following code. Return a corrected version and a short diff summary:\n\n{code}", DEV_SYSTEM)
-    credit(u.id, 0.04, "Fix reward")
-    await update.message.reply_markdown_v2(escape_md(res))
-
-async def tests_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    code = extract_code_from_text(update.message.text or "")
-    if not code:
-        await update.message.reply_text("Send code after /tests to generate unit tests")
-        return
-    add_message(u.id, "tests", "len="+str(len(code)))
-    res = await ai_complete(f"Write robust unit tests for this code. Use pytest where possible:\n\n{code}", DEV_SYSTEM)
-    credit(u.id, 0.04, "Tests reward")
-    await update.message.reply_markdown_v2(escape_md(res))
-
-async def app_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    spec = " ".join(context.args) if context.args else "python fastapi todo app with CRUD"
-    add_message(u.id, "app", spec)
-    plan = await ai_complete(f"Create a minimal but production-ready app scaffold as a single file. Include comments.\n\nSpec:\n{spec}", DEV_SYSTEM)
-    # return as file
-    buf = io.BytesIO(plan.encode("utf-8"))
-    buf.name = "app_scaffold.txt"
-    credit(u.id, 0.06, "App scaffold reward")
-    await update.message.reply_document(document=InputFile(buf), caption="Your app scaffold ✅")
-
-# --------- Admin Handlers ----------
-def is_admin(user_id: int) -> bool:
-    return ADMIN_USER_ID and user_id == ADMIN_USER_ID
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT COUNT(*) c FROM users"); users = cur.fetchone()["c"]
-    cur.execute("SELECT COUNT(*) c FROM messages"); msgs = cur.fetchone()["c"]
-    cur.execute("SELECT SUM(balance) s FROM treasury"); bal = cur.fetchone()["s"] or 0
-    con.close()
-    await update.message.reply_text(f"👥 Users: {users}\n💬 Messages: {msgs}\n💰 Total balances: {bal:.2f}")
-
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    text = " ".join(context.args) if context.args else ""
+async def tts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user; add_user(u.id, u.username or "")
+    sid = new_session(u.id, "tg")
+    text = " ".join(context.args) if context.args else (update.message.text or "").replace("/tts","",1).strip()
     if not text:
-        await update.message.reply_text("Usage: /broadcast your message")
+        await update.message.reply_text("Send like: /tts welcome to monster!")
         return
-    # naive broadcast (be careful with large user base)
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT user_id FROM users")
-    ids = [int(r["user_id"]) for r in cur.fetchall()]
-    con.close()
-    sent = 0
-    for uid in ids:
-        try:
-            await context.bot.send_message(uid, f"📣 {text}")
-            sent += 1
-            time.sleep(0.03)  # mild pacing
-        except Exception:
-            pass
-    await update.message.reply_text(f"Broadcast sent to {sent} users.")
+    audio = synthesize_tts(text)
+    await update.message.reply_voice(voice=audio)
+    log_event(u.id, sid, "tts", text, "[voice]")
 
-async def add_sponsor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+async def yt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user; add_user(u.id, u.username or "")
+    sid = new_session(u.id, "tg")
+    url = " ".join(context.args) if context.args else (update.message.text or "").replace("/yt","",1).strip()
+    if not url:
+        await update.message.reply_text("Send like: /yt https://youtube.com/watch?v=...")
         return
-    arg = " ".join(context.args) if context.args else ""
-    # format: title | url | weight
-    parts = [p.strip() for p in arg.split("|")]
-    if len(parts) < 2:
-        await update.message.reply_text("Usage: /add_sponsor Title | https://link | [weight]")
-        return
-    title, url = parts[0], parts[1]
-    weight = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 1
-    add_sponsor(title, url, weight)
-    await update.message.reply_text("Sponsor added ✅")
-
-async def list_sponsors_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    rows = list_sponsors()
-    if not rows:
-        await update.message.reply_text("No sponsors.")
-        return
-    lines = [f"{r['id']}. {r['title']} ({r['url']}) w={r['weight']} active={r['active']}" for r in rows]
-    await update.message.reply_text("Sponsors:\n" + "\n".join(lines[:1000]))
-
-async def del_sponsor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Usage: /del_sponsor <id>")
-        return
-    ok = del_sponsor(int(context.args[0]))
-    await update.message.reply_text("Deleted ✅" if ok else "Not found.")
-
-async def set_premium_link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    global PREMIUM_LINK
-    link = " ".join(context.args) if context.args else ""
-    if not link:
-        await update.message.reply_text("Usage: /set_premium_link <url>")
-        return
-    PREMIUM_LINK = link.strip()
-    await update.message.reply_text(f"Premium link set: {PREMIUM_LINK}")
-
-async def set_referral_payout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    global REFERRAL_PAYOUT
     try:
-        REFERRAL_PAYOUT = float(context.args[0])
-    except Exception:
-        await update.message.reply_text("Usage: /set_referral_payout <amount(float)>")
+        if not HAVE_YTDLP:
+            await update.message.reply_text("yt-dlp unavailable in this environment.")
+            return
+        await update.message.reply_text("Downloading…")
+        name, data = await asyncio.get_running_loop().run_in_executor(None, download_youtube, url)
+        bio = io.BytesIO(data); bio.name = name
+        await update.message.reply_document(document=bio)
+        log_event(u.id, sid, "yt", url, name)
+    except Exception as e:
+        await update.message.reply_text(f"Failed: {e}")
+
+async def img_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user; add_user(u.id, u.username or "")
+    sid = new_session(u.id, "tg")
+    prompt = " ".join(context.args) if context.args else (update.message.text or "").replace("/img","",1).strip()
+    if not prompt:
+        await update.message.reply_text("Send like: /img a cozy cabin in snow")
         return
-    await update.message.reply_text(f"Referral payout set: {REFERRAL_PAYOUT}")
+    msg, img = await ai_image(prompt)
+    if img:
+        await update.message.reply_photo(photo=img, caption="Here you go!")
+    else:
+        await update.message.reply_text(msg)
+    log_event(u.id, sid, "image", prompt, msg if not img else "[image]")
 
-# --------- Callback actions (buttons) ----------
-async def cb_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data or ""
-    if data == "action:ask":
-        await q.message.reply_text("Type: /ask <your question>")
-    elif data == "action:code":
-        await q.message.reply_text("Type: /code <what to generate>")
-    elif data == "action:ads":
-        await ads(update, context)
-    elif data == "action:bal":
-        await balance(update, context)
+async def inline_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    u = update.effective_user; add_user(u.id, u.username or "")
+    sid = new_session(u.id, "tg")
+    data = query.data
+    if data == "menu_dev":
+        await query.edit_message_text("Send /dev <your task>", reply_markup=kb_main())
+    elif data == "menu_img":
+        await query.edit_message_text("Send /img <prompt>", reply_markup=kb_main())
+    elif data == "menu_tts":
+        await query.edit_message_text("Send /tts <text>", reply_markup=kb_main())
+    elif data == "menu_yt":
+        await query.edit_message_text("Send /yt <url>", reply_markup=kb_main())
+    else:
+        await query.edit_message_text("Unknown", reply_markup=kb_main())
+    log_event(u.id, sid, "callback", data, "ok")
 
-# --------- Fallback chat (plain text -> /ask) ----------
-async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # treat plain text as /ask
-    context.args = [update.message.text]
-    await ask(update, context)
+# ---- Scheduler jobs
+scheduler = AsyncIOScheduler()
 
-# --------- Scheduler / Heartbeat ----------
-async def job_heartbeat(app):
-    # small log + occasional sponsor ping to admin
-    bal_sum = 0.0
+def job_heartbeat():
+    # summarize last hour logs & add tiny earning to simulate ads
     con = db(); cur = con.cursor()
-    cur.execute("SELECT SUM(balance) s FROM treasury"); s = cur.fetchone()["s"]
-    if s: bal_sum = float(s)
+    cur.execute("SELECT count(*) c FROM logs WHERE ts >= datetime('now','-1 hour')")
+    c = cur.fetchone()["c"]
     con.close()
-    log.info(f"Heartbeat: treasury total={bal_sum:.2f}")
+    sid = new_session(None, "system")
+    record_earning(sid, "ad", cents=max(0, min(5, c//10)), meta={"reason":"hourly_traffic"})
+    log.info(f"Heartbeat: logs_last_hour={c}")
 
-# --------- Utilities ----------
-def extract_code_from_text(text: str) -> str:
-    # try to pick code blocks ```...```
-    m = re.findall(r"```(?:[a-zA-Z0-9_+-]+)?\n(.*?)```", text, flags=re.S)
-    if m:
-        return "\n\n".join(m).strip()
-    # fallback: return text after first space
-    parts = text.split(maxsplit=1)
-    return parts[1] if len(parts) == 2 else ""
+scheduler.add_job(job_heartbeat, "interval", minutes=60, id="heartbeat")
 
-def escape_md(s: str) -> str:
-    # Telegram MarkdownV2 escaper
-    for ch in r"_*[]()~`>#+-=|{}.!":
-        s = s.replace(ch, "\\"+ch)
-    return s
+# ---- Bootstrap App + Bot
+def build_application() -> Application:
+    b = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN)
+    if RATE_LIMITER:
+        b = b.rate_limiter(RATE_LIMITER)
+    app = b.build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ask", ask_cmd))
+    app.add_handler(CommandHandler("dev", dev_cmd))
+    app.add_handler(CommandHandler("tts", tts_cmd))
+    app.add_handler(CommandHandler("yt", yt_cmd))
+    app.add_handler(CommandHandler("img", img_cmd))
+    app.add_handler(CallbackQueryHandler(inline_cb))
+    # Generic text -> /ask
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ask_cmd))
+    return app
 
-# --------- Main build ----------
-def build_application():
-    appb = ApplicationBuilder().token(TELEGRAM_TOKEN)
-    try:
-        appb = appb.rate_limiter(AIORateLimiter(max_retries=3))
-        log.info("Rate limiter enabled.")
-    except Exception:
-        log.warning("Rate limiter not available. Proceeding without it.")
-    application = appb.build()
+async def run_all():
+    # Start scheduler
+    scheduler.start()
+    # Start Telegram
+    if not TELEGRAM_BOT_TOKEN:
+        log.warning("TELEGRAM_BOT_TOKEN missing — Telegram bot will not start.")
+    else:
+        application = build_application()
+        asyncio.create_task(application.initialize())
+        asyncio.create_task(application.start())
+        asyncio.create_task(application.updater.start_polling())
+        log.info("Telegram bot started (polling).")
 
-    # Handlers
-    application.add_handler(CommandHandler(["start","help"], start))
-    application.add_handler(CommandHandler("balance", balance))
-    application.add_handler(CommandHandler("premium", premium))
-    application.add_handler(CommandHandler("ads", ads))
+    # Start Flask (ASGI via hypercorn/uvicorn would be ideal; here use built-in in a thread)
+    # Use waitress? Keep simple: run in a thread via asyncio.to_thread + Werkzeug dev server is blocking.
+    # We'll spin a thread for Flask using WSGI server from Werkzeug.
+    import threading
+    def _run_flask():
+        app.run(host="0.0.0.0", port=PORT)
+    t = threading.Thread(target=_run_flask, daemon=True)
+    t.start()
 
-    application.add_handler(CommandHandler("ask", ask))
-    application.add_handler(CommandHandler("code", code_cmd))
-    application.add_handler(CommandHandler("explain", explain_cmd))
-    application.add_handler(CommandHandler("fix", fix_cmd))
-    application.add_handler(CommandHandler("tests", tests_cmd))
-    application.add_handler(CommandHandler("app", app_cmd))
-
-    # Admin
-    application.add_handler(CommandHandler("stats", stats))
-    application.add_handler(CommandHandler("broadcast", broadcast))
-    application.add_handler(CommandHandler("add_sponsor", add_sponsor_cmd))
-    application.add_handler(CommandHandler("list_sponsors", list_sponsors_cmd))
-    application.add_handler(CommandHandler("del_sponsor", del_sponsor_cmd))
-    application.add_handler(CommandHandler("set_premium_link", set_premium_link_cmd))
-    application.add_handler(CommandHandler("set_referral_payout", set_referral_payout_cmd))
-
-    # ✅ Fix: use CallbackQueryHandler instead of UpdateType
-    application.add_handler(CallbackQueryHandler(cb_action))
-
-    # Fallback plain text
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text))
-
-    return application
+    # Keep the event loop alive
+    while True:
+        await asyncio.sleep(3600)
 
 def main():
-    log.info("OpenAI client will be enabled." if OPENAI_API_KEY else "OpenAI client disabled.")
-    init_db()
-    log.info("DB ready (schema ensured).")
-
-    app = build_application()
-
-    # Force delete webhook (avoid webhook/polling conflict)
+    if not os.path.exists(DB_PATH):
+        ensure_schema()
+    log.info("Monster starting…")
     try:
-        app.bot.delete_webhook(drop_pending_updates=False)
-        log.info("deleteWebhook sent.")
-    except Exception:
+        asyncio.run(run_all())
+    except (KeyboardInterrupt, SystemExit):
         pass
-
-    # Scheduler
-    scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(lambda: app.create_task(job_heartbeat(app)), "interval", hours=1, next_run_time=datetime.utcnow()+timedelta(seconds=10))
-    scheduler.start()
-    log.info("Scheduler started.")
-
-    # Polling mode (Render free tier friendly)
-    log.info("Mode: POLLING")
-    app.run_polling(drop_pending_updates=False, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
