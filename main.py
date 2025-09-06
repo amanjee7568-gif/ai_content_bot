@@ -1,695 +1,681 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Monster AI Module — Single File (Telegram + Flask + Monetization)
-Author: You
-Python: 3.11+ (PTB v21+)
+# main.py
+# Single-file: Telegram Bot + Flask Web + SQLite + Monetization + AI (OpenAI + HF) + Developer Agent + Scheduler
+# Python 3.11+ recommended. Works with python-telegram-bot == 21.x
 
-Features:
-- OpenAI chat + HF fallback
-- Dev Agent (code gen/fix)
-- TTS (gTTS), YT download (yt-dlp)
-- Image gen (OpenAI), placeholder fallback
-- Monetization: ad slots (web), affiliate links, visit earnings, analytics
-- SQLite persistence
-- APScheduler jobs
-- Render/Railway friendly (PORT)
-"""
+import os
+import sys
+import json
+import time
+import uuid
+import queue
+import base64
+import random
+import logging
+import sqlite3
+import threading
+import datetime as dt
+from functools import wraps
+from urllib.parse import urlparse, urljoin
 
-import os, io, re, json, time, uuid, base64, sqlite3, logging, textwrap, asyncio, datetime as dt
-from dataclasses import dataclass
-from typing import Optional, Dict, Any, Tuple, List
+from flask import Flask, request, jsonify, make_response, redirect, url_for, Response
 
-# ---- Third-party
-from dotenv import load_dotenv
-from flask import Flask, request, jsonify, send_file, make_response, redirect
-from flask import render_template_string
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-import httpx
-from gtts import gTTS
-
-# Telegram PTB v21
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+# Telegram PTB 21.x
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    constants,
+)
 from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    ApplicationBuilder,
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
 )
 
-# Optional libs
+# Schedules
+from apscheduler.schedulers.background import BackgroundScheduler
+
+# AI: OpenAI (1.x) – optional
+OPENAI_OK = True
 try:
     from openai import OpenAI
-    HAVE_OPENAI = True
 except Exception:
-    HAVE_OPENAI = False
+    OPENAI_OK = False
 
-try:
-    import yt_dlp
-    HAVE_YTDLP = True
-except Exception:
-    HAVE_YTDLP = False
+# HTTP client
+import httpx
 
-# ---- Setup
-load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
+# -------------------------
+# Config & Logging
+# -------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 log = logging.getLogger("EconomyBot")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "").strip()
-HF_URL             = os.getenv("HUGGINGFACE_API_URL", "").strip()
-HF_TOKEN           = os.getenv("HUGGINGFACE_API_TOKEN", "").strip()
-BASE_URL           = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
-ADMIN_USER_ID      = int(os.getenv("ADMIN_USER_ID", "0") or 0)
-AFFILIATE_TAG      = os.getenv("AFFILIATE_TAG", "mytag")
-PORT               = int(os.getenv("PORT", "8000"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+HUGGINGFACE_API_URL = os.getenv("HUGGINGFACE_API_URL", "https://candyai.com/artificialagents").strip()
+HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN", "").strip()
+DOMAIN = os.getenv("DOMAIN", os.getenv("RENDER_EXTERNAL_URL", "")).strip() or "http://localhost:5000"
+PORT = int(os.getenv("PORT", "5000"))
+SECRET_TOKEN = os.getenv("SECRET_TOKEN", "super-secret-token-change-me").strip()
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "").strip()
 
-DB_PATH = os.getenv("DB_PATH", "monster.db")
+if not TELEGRAM_BOT_TOKEN:
+    log.error("TELEGRAM_BOT_TOKEN missing in environment.")
+    sys.exit(1)
 
-# ---- DB
+# -------------------------
+# DB (SQLite)
+# -------------------------
+DB_PATH = os.getenv("DB_PATH", "bot.db")
+
 def db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def ensure_schema():
-    con = db()
-    cur = con.cursor()
-    cur.executescript("""
-    PRAGMA journal_mode=WAL;
-
-    CREATE TABLE IF NOT EXISTS users(
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_seen TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS sessions(
-        id TEXT PRIMARY KEY,
-        user_id INTEGER,
-        channel TEXT,           -- 'tg' or 'web'
-        created TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_active TIMESTAMP,
-        FOREIGN KEY(user_id) REFERENCES users(user_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS logs(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        session_id TEXT,
-        kind TEXT,              -- 'chat','code','tts','yt','image','visit','callback'
-        input TEXT,
-        output TEXT,
-        tokens_in INTEGER DEFAULT 0,
-        tokens_out INTEGER DEFAULT 0,
-        ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS earnings(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT,
-        source TEXT,            -- 'ad','affiliate','visit','pro'
-        amount_cents INTEGER DEFAULT 0,
-        meta TEXT,
-        ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS affiliates(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        raw_url TEXT,
-        tagged_url TEXT,
-        created TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
+def db_init():
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            chat_id TEXT PRIMARY KEY,
+            username TEXT,
+            first_seen TIMESTAMP,
+            last_seen TIMESTAMP,
+            visits INTEGER DEFAULT 0,
+            tokens_used INTEGER DEFAULT 0
+        )
     """)
-    con.commit()
-    con.close()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS treasury (
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            earned REAL DEFAULT 0,
+            spent REAL DEFAULT 0
+        )
+    """)
+    cur.execute("""
+        INSERT OR IGNORE INTO treasury (id, earned, spent) VALUES (1, 0, 0)
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS impressions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TIMESTAMP,
+            ip TEXT,
+            path TEXT,
+            ref TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TIMESTAMP,
+            level TEXT,
+            message TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+    log.info("DB ready (schema ensured).")
 
-ensure_schema()
-log.info("DB ready (schema ensured).")
-
-# ---- OpenAI & HF clients
-client_oa: Optional[OpenAI] = None
-if HAVE_OPENAI and OPENAI_API_KEY:
+def log_event(level: str, message: str):
     try:
-        client_oa = OpenAI(api_key=OPENAI_API_KEY)
+        conn = db()
+        conn.execute(
+            "INSERT INTO logs (ts, level, message) VALUES (?, ?, ?)",
+            (dt.datetime.utcnow(), level, message[:1000])
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning(f"Failed to log event: {e}")
+
+def treasury_add(amount: float):
+    conn = db()
+    conn.execute("UPDATE treasury SET earned = earned + ? WHERE id=1", (amount,))
+    conn.commit()
+    conn.close()
+
+def treasury_spend(amount: float):
+    conn = db()
+    conn.execute("UPDATE treasury SET spent = spent + ? WHERE id=1", (amount,))
+    conn.commit()
+    conn.close()
+
+def treasury_get():
+    conn = db()
+    row = conn.execute("SELECT earned, spent FROM treasury WHERE id=1").fetchone()
+    conn.close()
+    if not row:
+        return 0.0, 0.0
+    return float(row["earned"]), float(row["spent"])
+
+def user_touch(chat_id: int, username: str | None):
+    conn = db()
+    now = dt.datetime.utcnow()
+    conn.execute("""
+        INSERT INTO users (chat_id, username, first_seen, last_seen)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET username=excluded.username, last_seen=excluded.last_seen
+    """, (str(chat_id), username, now, now))
+    conn.commit()
+    conn.close()
+
+def user_add_visit():
+    # Called from web landing via cookie/IP
+    conn = db()
+    # Use special row for "-1" to track anonymous visits as well
+    conn.execute("""
+        INSERT INTO users (chat_id, username, first_seen, last_seen, visits)
+        VALUES ('-1', 'anonymous', ?, ?, 1)
+        ON CONFLICT(chat_id) DO UPDATE SET visits = visits + 1, last_seen = excluded.last_seen
+    """, (dt.datetime.utcnow(), dt.datetime.utcnow()))
+    conn.commit()
+    conn.close()
+
+# -------------------------
+# Monetization rules
+# -------------------------
+VISIT_EARN = float(os.getenv("EARN_PER_VISIT", "0.002"))           # $ per site visit
+MESSAGE_EARN = float(os.getenv("EARN_PER_MESSAGE", "0.001"))       # $ per message handled
+AD_IMPRESSION_EARN = float(os.getenv("EARN_PER_AD", "0.0005"))     # $ per ad tag view
+
+# -------------------------
+# AI Clients (OpenAI + HF)
+# -------------------------
+OAI_CLIENT = None
+if OPENAI_OK and OPENAI_API_KEY:
+    try:
+        OAI_CLIENT = OpenAI(api_key=OPENAI_API_KEY)
         log.info("OpenAI client initialized.")
     except Exception as e:
         log.warning(f"OpenAI init failed: {e}")
+else:
+    log.info("OpenAI client will be disabled (no key or lib).")
 
-HAVE_HF = bool(HF_URL and HF_TOKEN)
+HTTP_TIMEOUT = 60
 
-# ---- Utils
-def now_ts() -> str:
-    return dt.datetime.utcnow().isoformat() + "Z"
+def ai_complete(prompt: str, system: str | None = None, max_tokens: int = 600, temperature: float = 0.6) -> str:
+    """
+    First tries OpenAI responses; if unavailable, falls back to HuggingFace endpoint.
+    """
+    # Try OpenAI
+    if OAI_CLIENT:
+        try:
+            msg = [{"role": "user", "content": prompt}]
+            if system:
+                msg.insert(0, {"role": "system", "content": system})
+            # Use a sensible default model name; can be overridden via env MODEL
+            model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+            resp = OAI_CLIENT.chat.completions.create(
+                model=model,
+                messages=msg,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            out = resp.choices[0].message.content or ""
+            if out.strip():
+                return out.strip()
+        except Exception as e:
+            log.warning(f"OpenAI failed, will fallback. {e}")
 
-def new_session(user_id: Optional[int], channel: str) -> str:
-    sid = uuid.uuid4().hex
-    con = db(); cur = con.cursor()
-    cur.execute("INSERT INTO sessions(id,user_id,channel,last_active) VALUES(?,?,?,CURRENT_TIMESTAMP)", (sid, user_id, channel))
-    con.commit(); con.close()
-    return sid
+    # Fallback to "HuggingFace"-style (here your custom URL)
+    try:
+        headers = {
+            "Authorization": f"Bearer {HUGGINGFACE_API_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "max_new_tokens": max_tokens,
+                "temperature": temperature,
+                "return_full_text": False
+            }
+        }
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            r = client.post(HUGGINGFACE_API_URL, headers=headers, json=payload)
+            r.raise_for_status()
+            data = r.json()
+            # Try common response shapes
+            if isinstance(data, list) and data and "generated_text" in data[0]:
+                return (data[0]["generated_text"] or "").strip()
+            if "generated_text" in data:
+                return (data["generated_text"] or "").strip()
+            if "text" in data:
+                return (data["text"] or "").strip()
+            # Fallback stringify
+            return str(data)[:4000]
+    except Exception as e:
+        log.error(f"HuggingFace fallback failed: {e}")
+        return "⚠️ AI backend currently unavailable. Please try again."
 
-def touch_session(session_id: str):
-    con = db(); cur = con.cursor()
-    cur.execute("UPDATE sessions SET last_active=CURRENT_TIMESTAMP WHERE id=?", (session_id,))
-    con.commit(); con.close()
-
-def log_event(user_id: Optional[int], session_id: Optional[str], kind: str, inp: str, out: str, ti=0, to=0):
-    con = db(); cur = con.cursor()
-    cur.execute("INSERT INTO logs(user_id,session_id,kind,input,output,tokens_in,tokens_out) VALUES(?,?,?,?,?,?,?)",
-                (user_id, session_id, kind, inp[:2000], out[:2000], ti, to))
-    con.commit(); con.close()
-
-def add_user(user_id: int, username: str = ""):
-    con = db(); cur = con.cursor()
-    cur.execute("INSERT INTO users(user_id,username,first_seen,last_seen) VALUES(?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) "
-                "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, last_seen=CURRENT_TIMESTAMP",
-                (user_id, username))
-    con.commit(); con.close()
-
-def record_earning(session_id: str, source: str, cents: int, meta: Dict[str, Any]):
-    con = db(); cur = con.cursor()
-    cur.execute("INSERT INTO earnings(session_id,source,amount_cents,meta) VALUES(?,?,?,?)",
-                (session_id, source, cents, json.dumps(meta)[:1000]))
-    con.commit(); con.close()
-
-def make_affiliate(url: str) -> str:
-    # very basic example: append ?tag=AFFILIATE_TAG
-    sep = "&" if "?" in url else "?"
-    tagged = f"{url}{sep}tag={AFFILIATE_TAG}"
-    con = db(); cur = con.cursor()
-    cur.execute("INSERT INTO affiliates(raw_url,tagged_url) VALUES(?,?)", (url, tagged))
-    con.commit(); con.close()
-    return tagged
-
-# ---- AI Core
-SYSTEM_PROMPT = (
-    "You are Monster, a super-capable AI assistant and developer agent. "
-    "Be concise, accurate, and pragmatic. When asked for code, produce complete runnable snippets. "
-    "If a task requires steps (plan -> code -> tests), output them clearly."
+# -------------------------
+# Developer Agent (code generator)
+# -------------------------
+AGENT_SYSTEM = (
+    "You are a senior software engineer. Generate production-grade, well-commented code. "
+    "Prefer Python/JS unless user specifies. Include setup/run notes succinctly."
 )
 
-async def ai_chat(prompt: str) -> str:
-    """OpenAI chat with HF fallback."""
-    # Try OpenAI (Responses API style)
-    if client_oa:
-        try:
-            resp = client_oa.responses.create(
-                model="gpt-4o-mini",  # economical; change to your best available
-                input=[{"role":"system","content":SYSTEM_PROMPT},
-                       {"role":"user","content":prompt}],
-                temperature=0.2,
-            )
-            txt = resp.output_text or ""
-            if txt.strip():
-                return txt.strip()
-        except Exception as e:
-            log.warning(f"OpenAI fail: {e}")
-
-    # HuggingFace fallback (simple)
-    if HAVE_HF:
-        try:
-            headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-            payload = {
-                "inputs": f"System: {SYSTEM_PROMPT}\nUser: {prompt}\nAssistant:",
-                "parameters": {"max_new_tokens": 600, "temperature": 0.3},
-                "options": {"wait_for_model": True}
-            }
-            async with httpx.AsyncClient(timeout=60) as s:
-                r = await s.post(HF_URL, headers=headers, json=payload)
-                r.raise_for_status()
-                data = r.json()
-                # HF responses vary by model; try a few shapes
-                if isinstance(data, list) and data:
-                    txt = data[0].get("generated_text","")
-                else:
-                    txt = data.get("generated_text","") if isinstance(data, dict) else ""
-                return (txt or "Sorry, model returned empty.").strip()
-        except Exception as e:
-            log.warning(f"HF fail: {e}")
-
-    return "AI backend is not available right now. Please try again later."
-
-async def dev_agent(task: str) -> str:
-    """Developer agent: plan + code + tests."""
+def generate_code(spec: str) -> str:
     prompt = f"""
-Act as a senior software engineer. For the task below:
-1) Brief Plan
-2) Key Files (with paths) and complete code blocks
-3) Quick test instructions
+You are a full-stack agent. Based on the user's request, produce a working solution.
 
-Task:
-{task}
+User spec:
+\"\"\"
+{spec}
+\"\"\"
+
+Deliver:
+1) Short plan
+2) Complete code blocks (minimal but runnable)
+3) Quick run instructions
 """
-    return await ai_chat(prompt)
+    return ai_complete(prompt, system=AGENT_SYSTEM, max_tokens=900, temperature=0.4)
 
-async def ai_image(prompt: str) -> Tuple[str, Optional[bytes]]:
-    """
-    Returns (message, image_bytes or None).
-    """
-    if client_oa:
-        try:
-            img = client_oa.images.generate(model="gpt-image-1", prompt=prompt, size="1024x1024")
-            b64 = img.data[0].b64_json
-            return ("Image generated with OpenAI.", base64.b64decode(b64))
-        except Exception as e:
-            log.warning(f"img gen fail: {e}")
-    # fallback
-    return ("Image service unavailable; showing placeholder.", None)
+# -------------------------
+# Telegram Handlers
+# -------------------------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_touch(user.id, user.username)
+    treasury_add(MESSAGE_EARN)
 
-def synthesize_tts(text: str) -> bytes:
-    tts = gTTS(text=text, lang="en")
-    buf = io.BytesIO()
-    tts.write_to_fp(buf)
-    buf.seek(0)
-    return buf.read()
+    keyboard = [
+        [InlineKeyboardButton("🧠 Ask AI", callback_data="ask_ai"),
+         InlineKeyboardButton("👨‍💻 Generate Code", callback_data="gen_code")],
+        [InlineKeyboardButton("💰 Balance", callback_data="balance"),
+         InlineKeyboardButton("🌐 Visit Site", url=DOMAIN)],
+    ]
+    await update.message.reply_html(
+        "👋 <b>Welcome!</b>\n"
+        "I’m your all-in-one AI assistant + developer agent.\n\n"
+        "Type your question, or use /code to generate apps/scripts.\n"
+        "Use /balance to see revenue & stats.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
-def download_youtube(url: str) -> Tuple[str, bytes]:
-    if not HAVE_YTDLP:
-        raise RuntimeError("yt-dlp not installed in this environment.")
-    ydl_opts = {
-        "format": "mp4",
-        "outtmpl": "-",
-        "quiet": True,
-        "noplaylist": True,
-    }
-    # We'll download to buffer by using a file then read; yt-dlp doesn't write to stdout reliably for mp4
-    tmp = f"/tmp/{uuid.uuid4().hex}.mp4"
-    ydl_opts["outtmpl"] = tmp
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-    with open(tmp, "rb") as f:
-        data = f.read()
-    os.remove(tmp)
-    return ("video.mp4", data)
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    treasury_add(MESSAGE_EARN)
+    await update.message.reply_text(
+        "Commands:\n"
+        "/start - welcome\n"
+        "/help - this help\n"
+        "/ask <query> - instant AI answer\n"
+        "/code <spec> - developer agent code generator\n"
+        "/balance - revenue & usage\n"
+        "/pro - why upgrade"
+    )
 
-# ---- Flask Web App
+async def cmd_pro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    treasury_add(MESSAGE_EARN)
+    await update.message.reply_html(
+        "<b>Pro Features</b>\n"
+        "• Longer contexts & faster replies\n"
+        "• Better code generation & testing stubs\n"
+        "• Priority support\n\n"
+        f"Visit: {DOMAIN}"
+    )
+
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    treasury_add(MESSAGE_EARN)
+    earned, spent = treasury_get()
+    net = earned - spent
+    await update.message.reply_text(
+        f"📊 Treasury\n"
+        f"Earned: ${earned:.4f}\nSpent: ${spent:.4f}\nNet: ${net:.4f}"
+    )
+
+async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_touch(user.id, user.username)
+    treasury_add(MESSAGE_EARN)
+
+    query = " ".join(context.args) if context.args else ""
+    if not query:
+        await update.message.reply_text("Usage: /ask <your question>")
+        return
+
+    await update.message.chat.send_action(constants.ChatAction.TYPING)
+    resp = ai_complete(query, system="Be concise, accurate and helpful.", max_tokens=700)
+    await update.message.reply_text(resp[:4096])
+
+async def cmd_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_touch(user.id, user.username)
+    treasury_add(MESSAGE_EARN)
+
+    spec = " ".join(context.args) if context.args else ""
+    if not spec:
+        await update.message.reply_text("Usage: /code <what to build>\nExample: /code FastAPI URL shortener with SQLite")
+        return
+    await update.message.chat.send_action(constants.ChatAction.TYPING)
+    code = generate_code(spec)
+    # Telegram max message size -> split if needed
+    for chunk in split_text(code, 3900):
+        await update.message.reply_text(chunk, parse_mode=constants.ParseMode.MARKDOWN)
+
+def split_text(text: str, limit: int):
+    buf = []
+    cur = []
+    total = 0
+    for line in text.splitlines(keepends=True):
+        if total + len(line) > limit and cur:
+            buf.append("".join(cur))
+            cur = [line]
+            total = len(line)
+        else:
+            cur.append(line)
+            total += len(line)
+    if cur:
+        buf.append("".join(cur))
+    return buf
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    txt = update.message.text.strip() if update.message and update.message.text else ""
+    if not txt:
+        return
+    user_touch(user.id, user.username)
+    treasury_add(MESSAGE_EARN)
+    await update.message.chat.send_action(constants.ChatAction.TYPING)
+    reply = ai_complete(txt, system="Helpful, direct, step-by-step when needed.", max_tokens=700)
+    await update.message.reply_text(reply[:4096])
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    if data == "ask_ai":
+        await query.message.reply_text("Ask me anything with /ask <question> 🤖")
+    elif data == "gen_code":
+        await query.message.reply_text("Describe what to build using /code <spec> 👨‍💻")
+    elif data == "balance":
+        earned, spent = treasury_get()
+        net = earned - spent
+        await query.message.reply_text(f"📊 Earned ${earned:.4f} | Spent ${spent:.4f} | Net ${net:.4f}")
+    else:
+        await query.message.reply_text("Unknown action.")
+
+# -------------------------
+# Flask App (Landing + Health + Monetization)
+# -------------------------
 app = Flask(__name__)
 
-BASE_HTML = """
+def set_csp(resp: Response):
+    resp.headers["Content-Security-Policy"] = "default-src 'self' https: data: 'unsafe-inline' 'unsafe-eval';"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "SAMEORIGIN"
+    resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return resp
+
+@app.before_request
+def before_request_log():
+    try:
+        ip = request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown"
+        ref = request.headers.get("Referer", "")
+        path = request.path
+        conn = db()
+        conn.execute("INSERT INTO impressions (ts, ip, path, ref) VALUES (?, ?, ?, ?)",
+                     (dt.datetime.utcnow(), ip, path, ref[:500]))
+        conn.commit()
+        conn.close()
+
+        # Monetize: site visit / ad view
+        if path == "/":
+            user_add_visit()
+            treasury_add(VISIT_EARN)
+        if "ad=1" in request.query_string.decode("utf-8", errors="ignore"):
+            treasury_add(AD_IMPRESSION_EARN)
+
+    except Exception as e:
+        log.warning(f"before_request error: {e}")
+
+@app.after_request
+def after(resp):
+    return set_csp(resp)
+
+@app.get("/")
+def home():
+    # Simple landing with a fake ad slot (non-violative placeholder).
+    html = f"""
 <!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Monster AI</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="preconnect" href="https://cdn.jsdelivr.net">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.classless.min.css">
+<title>Ganesh A.I. – Developer Agent</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-  .hero {padding: 1.5rem; border-radius: 16px; background: #111; color:#eee;}
-  .ad-slot{min-height:120px;border:1px dashed #aaa;display:flex;align-items:center;justify-content:center;margin:10px 0;border-radius:12px}
-  .mono{font-family: ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace}
+body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:0; padding:0; background:#0b0d10; color:#e8eef5; }}
+header {{ padding:24px; text-align:center; background:linear-gradient(90deg,#0b0d10,#121521); }}
+h1 {{ margin:0; font-size:28px; }}
+main {{ max-width:960px; margin:20px auto; padding:0 16px 40px; }}
+.card {{ background:#141823; border:1px solid #1f2536; border-radius:16px; padding:20px; margin:16px 0; box-shadow:0 10px 30px rgba(0,0,0,.25); }}
+.cta {{ display:inline-block; padding:12px 18px; border-radius:12px; background:#2a64ff; color:#fff; text-decoration:none; font-weight:700; }}
+.small {{ font-size:13px; opacity:.8 }}
+.grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:16px; }}
+.ad {{ display:block; height:120px; border-radius:12px; background:#0f1320; border:1px dashed #2f3b5f; place-items:center; color:#9fb3ff; text-align:center; font-weight:600; }}
+footer {{ text-align:center; padding:20px; opacity:.7 }}
+code {{ background:#0f1320; padding:2px 6px; border-radius:6px; }}
 </style>
-<!-- Google AdSense (placeholder) -->
-<!-- Replace with your client id
-<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-XXXX" crossorigin="anonymous"></script>
--->
 </head>
 <body>
-<main class="container">
-  <section class="hero">
-    <h2>Monster AI — Developer Agent + Chat</h2>
-    <p>Visit earns are counted. Ads & affiliate integrated.</p>
-  </section>
-
-  <div class="ad-slot">Ad Slot (header)</div>
-
-  <form id="askform">
-    <label>Ask anything</label>
-    <textarea name="q" id="q" rows="4" placeholder="Ask Monster..." required></textarea>
-    <button type="submit">Ask</button>
-  </form>
-
-  <article>
-    <h4>Response</h4>
-    <pre class="mono" id="resp"></pre>
-  </article>
-
-  <div class="grid">
-    <div>
-      <h5>Dev Agent</h5>
-      <textarea id="devtask" rows="4" placeholder="Build me a Flask API with JWT..."></textarea>
-      <button id="devbtn">Generate</button>
-    </div>
-    <div>
-      <h5>TTS</h5>
-      <textarea id="tts_text" rows="4" placeholder="Text to speak..."></textarea>
-      <button id="tts_btn">Synthesize</button>
-      <div id="tts_out"></div>
-    </div>
+<header>
+  <h1>Ganesh A.I. – World's Most Powerful Developer Agent</h1>
+</header>
+<main>
+  <div class="card">
+    <p>Build apps, generate scripts, and get instant answers like ChatGPT—plus revenue features built-in.</p>
+    <p><a class="cta" href="https://t.me/{get_bot_username_safe()}">Open Telegram Bot</a></p>
+    <p class="small">Tip: Visiting this page & viewing ad placeholders supports the project.</p>
   </div>
 
   <div class="grid">
-    <div>
-      <h5>Image</h5>
-      <input id="img_prompt" placeholder="A cyberpunk city at dawn"/>
-      <button id="img_btn">Generate Image</button>
-      <div id="img_out"></div>
+    <div class="card">
+      <h3>🔥 Instant AI</h3>
+      <p>Ask any question. Use <code>/ask</code> in Telegram.</p>
     </div>
-    <div>
-      <h5>Affiliate</h5>
-      <input id="aff_url" placeholder="https://amazon.in/some-product"/>
-      <button id="aff_btn">Make Affiliate Link</button>
-      <pre class="mono" id="aff_out"></pre>
+    <div class="card">
+      <h3>👨‍💻 Developer Agent</h3>
+      <p>Generate production-grade code via <code>/code</code>.</p>
+    </div>
+    <div class="card">
+      <h3>💰 Monetization</h3>
+      <p>Visits & ad tags auto-earn into treasury.</p>
     </div>
   </div>
 
-  <div class="ad-slot">Ad Slot (footer)</div>
+  <div class="card">
+    <div class="ad">
+      AD SLOT — viewing increments revenue. <a href="?ad=1" style="color:#9fb3ff">Refresh with ?ad=1</a>
+    </div>
+  </div>
 
-  <footer>
-    <small>© Monster AI</small>
-  </footer>
+  <div class="card small">
+    <b>Webhook URL (optional):</b><br>
+    {DOMAIN}/webhook/{SECRET_TOKEN}
+  </div>
 </main>
-
-<script>
-const sid = localStorage.getItem("monster_sid") || crypto.randomUUID();
-localStorage.setItem("monster_sid", sid);
-
-// Visit earning ping
-fetch("/api/visit?sid="+sid).catch(()=>{});
-
-const q = (id)=>document.getElementById(id);
-
-document.getElementById("askform").addEventListener("submit", async (e)=>{
-  e.preventDefault();
-  const txt = q("q").value.trim();
-  q("resp").textContent = "Thinking...";
-  const r = await fetch("/api/ask", {method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({sid, q: txt})});
-  const j = await r.json();
-  q("resp").textContent = j.answer || j.error || "No response";
-});
-
-q("devbtn").onclick = async ()=>{
-  const task = q("devtask").value.trim();
-  const r = await fetch("/api/dev", {method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({sid, task})});
-  const j = await r.json();
-  q("resp").textContent = j.answer || j.error || "No response";
-};
-
-q("tts_btn").onclick = async ()=>{
-  const t = q("tts_text").value.trim();
-  const r = await fetch("/api/tts", {method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({sid, text: t})});
-  const blob = await r.blob();
-  const url = URL.createObjectURL(blob);
-  q("tts_out").innerHTML = '<audio controls src="'+url+'"></audio>';
-};
-
-q("img_btn").onclick = async ()=>{
-  const p = q("img_prompt").value.trim();
-  const r = await fetch("/api/image", {method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({sid, prompt: p})});
-  const ct = r.headers.get("Content-Type");
-  if (ct && ct.startsWith("image/")){
-    const blob = await r.blob();
-    const url = URL.createObjectURL(blob);
-    q("img_out").innerHTML = '<img style="max-width:100%" src="'+url+'"/>';
-  } else {
-    const j = await r.json();
-    q("img_out").textContent = j.message || "No image";
-  }
-};
-
-q("aff_btn").onclick = async ()=>{
-  const u = q("aff_url").value.trim();
-  const r = await fetch("/api/aff", {method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({url: u})});
-  const j = await r.json();
-  q("aff_out").textContent = j.tagged_url || j.error || "";
-};
-</script>
+<footer>© {dt.datetime.utcnow().year} Ganesh A.I.</footer>
 </body>
 </html>
-"""
+    """
+    return html
 
-@app.route("/")
-def home():
-    return render_template_string(BASE_HTML)
-
-@app.route("/health")
+@app.get("/healthz")
 def health():
-    return jsonify({"ok": True, "ts": now_ts()})
+    earned, spent = treasury_get()
+    return jsonify(
+        ok=True,
+        time=dt.datetime.utcnow().isoformat(),
+        treasury={"earned": earned, "spent": spent},
+    )
 
-@app.post("/api/ask")
-async def api_ask():
-    data = request.get_json(force=True, silent=True) or {}
-    sid = data.get("sid") or new_session(None, "web")
-    q = (data.get("q") or "").strip()
-    touch_session(sid)
-    if not q:
-        return jsonify({"error":"empty question"}), 400
-    ans = await ai_chat(q)
-    log_event(None, sid, "chat", q, ans)
-    # Monetization: per-answer earning hook (tiny)
-    record_earning(sid, "pro", cents=1, meta={"reason":"answer"})
-    return jsonify({"answer": ans, "sid": sid})
+# Optional: Telegram webhook endpoint (if you want to switch to webhook mode later)
+@app.post(f"/webhook/{SECRET_TOKEN}")
+def webhook():
+    # Basic header check for Telegram secret token (optional hardening)
+    tg_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if tg_secret and tg_secret != SECRET_TOKEN:
+        return jsonify({"ok": False, "error": "bad secret"}), 403
 
-@app.post("/api/dev")
-async def api_dev():
-    data = request.get_json(force=True, silent=True) or {}
-    sid = data.get("sid") or new_session(None, "web")
-    task = (data.get("task") or "").strip()
-    touch_session(sid)
-    if not task:
-        return jsonify({"error":"empty task"}), 400
-    ans = await dev_agent(task)
-    log_event(None, sid, "code", task, ans)
-    record_earning(sid, "pro", cents=2, meta={"reason":"dev"})
-    return jsonify({"answer": ans})
-
-@app.post("/api/tts")
-def api_tts():
-    data = request.get_json(force=True, silent=True) or {}
-    sid = data.get("sid") or new_session(None, "web")
-    text = (data.get("text") or "").strip()
-    touch_session(sid)
-    if not text:
-        return jsonify({"error":"empty text"}), 400
-    audio = synthesize_tts(text)
-    log_event(None, sid, "tts", text, "[audio]")
-    record_earning(sid, "pro", cents=1, meta={"reason":"tts"})
-    return send_file(io.BytesIO(audio), mimetype="audio/mpeg", as_attachment=False, download_name="speech.mp3")
-
-@app.post("/api/image")
-async def api_image():
-    data = request.get_json(force=True, silent=True) or {}
-    sid = data.get("sid") or new_session(None, "web")
-    prompt = (data.get("prompt") or "").strip()
-    touch_session(sid)
-    if not prompt:
-        return jsonify({"error":"empty prompt"}), 400
-    msg, img = await ai_image(prompt)
-    if img:
-        log_event(None, sid, "image", prompt, "[image]")
-        record_earning(sid, "pro", cents=2, meta={"reason":"image"})
-        return send_file(io.BytesIO(img), mimetype="image/png", as_attachment=False, download_name="image.png")
-    else:
-        log_event(None, sid, "image", prompt, msg)
-        return jsonify({"message": msg})
-
-@app.post("/api/aff")
-def api_aff():
-    data = request.get_json(force=True, silent=True) or {}
-    url = (data.get("url") or "").strip()
-    if not url:
-        return jsonify({"error":"empty url"}), 400
-    tagged = make_affiliate(url)
-    return jsonify({"tagged_url": tagged})
-
-@app.get("/api/visit")
-def api_visit():
-    sid = request.args.get("sid") or new_session(None, "web")
-    touch_session(sid)
-    log_event(None, sid, "visit", "landing", "ok")
-    # Visit earning (tiny)
-    record_earning(sid, "visit", cents=1, meta={"path": request.path, "ua": request.headers.get("User-Agent","")[:120]})
-    return jsonify({"ok": True, "sid": sid})
-
-# ---- Telegram Bot
-
-RATE_LIMITER = None
-try:
-    from telegram.ext import AIORateLimiter
-    RATE_LIMITER = AIORateLimiter(max_retries=3)
-    log.info("Rate limiter enabled.")
-except Exception:
-    log.warning("Rate limiter not available. Proceeding without it.")
-
-def kb_main():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧠 Dev Agent", callback_data="menu_dev"),
-         InlineKeyboardButton("🖼️ Image", callback_data="menu_img")],
-        [InlineKeyboardButton("🔊 TTS", callback_data="menu_tts"),
-         InlineKeyboardButton("⬇️ YT", callback_data="menu_yt")]
-    ])
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    add_user(u.id, u.username or "")
-    sid = new_session(u.id, "tg")
-    text = ("Monster AI ready!\n"
-            "Use /ask <question>\n"
-            "/dev <task>\n"
-            "/tts <text>\n"
-            "/yt <url>\n"
-            "/img <prompt>\n")
-    await update.effective_chat.send_message(text, reply_markup=kb_main())
-    log_event(u.id, sid, "visit", "start", "ok")
-    record_earning(sid, "visit", 1, {"via":"tg_start"})
-
-async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user; add_user(u.id, u.username or "")
-    sid = new_session(u.id, "tg")
-    q = " ".join(context.args) if context.args else (update.message.text or "").replace("/ask","",1).strip()
-    if not q:
-        await update.message.reply_text("Send like: /ask how to center a div?")
-        return
-    await update.message.reply_text("Thinking…")
-    ans = await ai_chat(q)
-    await update.message.reply_text(ans[:4000])
-    log_event(u.id, sid, "chat", q, ans)
-
-async def dev_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user; add_user(u.id, u.username or "")
-    sid = new_session(u.id, "tg")
-    task = " ".join(context.args) if context.args else (update.message.text or "").replace("/dev","",1).strip()
-    if not task:
-        await update.message.reply_text("Send like: /dev build a todo app with FastAPI and SQLite")
-        return
-    await update.message.reply_text("Engineering…")
-    ans = await dev_agent(task)
-    await update.message.reply_text(ans[:4000], disable_web_page_preview=True)
-    log_event(u.id, sid, "code", task, ans)
-
-async def tts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user; add_user(u.id, u.username or "")
-    sid = new_session(u.id, "tg")
-    text = " ".join(context.args) if context.args else (update.message.text or "").replace("/tts","",1).strip()
-    if not text:
-        await update.message.reply_text("Send like: /tts welcome to monster!")
-        return
-    audio = synthesize_tts(text)
-    await update.message.reply_voice(voice=audio)
-    log_event(u.id, sid, "tts", text, "[voice]")
-
-async def yt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user; add_user(u.id, u.username or "")
-    sid = new_session(u.id, "tg")
-    url = " ".join(context.args) if context.args else (update.message.text or "").replace("/yt","",1).strip()
-    if not url:
-        await update.message.reply_text("Send like: /yt https://youtube.com/watch?v=...")
-        return
     try:
-        if not HAVE_YTDLP:
-            await update.message.reply_text("yt-dlp unavailable in this environment.")
-            return
-        await update.message.reply_text("Downloading…")
-        name, data = await asyncio.get_running_loop().run_in_executor(None, download_youtube, url)
-        bio = io.BytesIO(data); bio.name = name
-        await update.message.reply_document(document=bio)
-        log_event(u.id, sid, "yt", url, name)
+        data = request.get_json(force=True, silent=True) or {}
+        # Enqueue for bot to process (only if application started)
+        if BOT_APPLICATION is not None:
+            BOT_APPLICATION.update_queue.put_nowait(Update.de_json(data, BOT_APPLICATION.bot))
+            # Earn per message/update
+            treasury_add(MESSAGE_EARN)
+        return jsonify({"ok": True})
     except Exception as e:
-        await update.message.reply_text(f"Failed: {e}")
+        log.error(f"Webhook error: {e}")
+        return jsonify({"ok": False}), 500
 
-async def img_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user; add_user(u.id, u.username or "")
-    sid = new_session(u.id, "tg")
-    prompt = " ".join(context.args) if context.args else (update.message.text or "").replace("/img","",1).strip()
-    if not prompt:
-        await update.message.reply_text("Send like: /img a cozy cabin in snow")
-        return
-    msg, img = await ai_image(prompt)
-    if img:
-        await update.message.reply_photo(photo=img, caption="Here you go!")
-    else:
-        await update.message.reply_text(msg)
-    log_event(u.id, sid, "image", prompt, msg if not img else "[image]")
-
-async def inline_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    u = update.effective_user; add_user(u.id, u.username or "")
-    sid = new_session(u.id, "tg")
-    data = query.data
-    if data == "menu_dev":
-        await query.edit_message_text("Send /dev <your task>", reply_markup=kb_main())
-    elif data == "menu_img":
-        await query.edit_message_text("Send /img <prompt>", reply_markup=kb_main())
-    elif data == "menu_tts":
-        await query.edit_message_text("Send /tts <text>", reply_markup=kb_main())
-    elif data == "menu_yt":
-        await query.edit_message_text("Send /yt <url>", reply_markup=kb_main())
-    else:
-        await query.edit_message_text("Unknown", reply_markup=kb_main())
-    log_event(u.id, sid, "callback", data, "ok")
-
-# ---- Scheduler jobs
-scheduler = AsyncIOScheduler()
+# -------------------------
+# Scheduler Jobs
+# -------------------------
+SCHED = BackgroundScheduler()
 
 def job_heartbeat():
-    # summarize last hour logs & add tiny earning to simulate ads
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT count(*) c FROM logs WHERE ts >= datetime('now','-1 hour')")
-    c = cur.fetchone()["c"]
-    con.close()
-    sid = new_session(None, "system")
-    record_earning(sid, "ad", cents=max(0, min(5, c//10)), meta={"reason":"hourly_traffic"})
-    log.info(f"Heartbeat: logs_last_hour={c}")
+    earned, spent = treasury_get()
+    log.info(f"Heartbeat: treasury earned={earned:.4f} spent={spent:.4f}")
+    log_event("INFO", f"heartbeat earned={earned:.4f} spent={spent:.4f}")
 
-scheduler.add_job(job_heartbeat, "interval", minutes=60, id="heartbeat")
+def job_daily_note():
+    if not ADMIN_USER_ID or BOT_APPLICATION is None:
+        return
+    try:
+        earned, spent = treasury_get()
+        net = earned - spent
+        text = f"💡 Daily Summary: Earned ${earned:.4f} | Spent ${spent:.4f} | Net ${net:.4f}"
+        BOT_APPLICATION.bot.send_message(chat_id=int(ADMIN_USER_ID), text=text)
+    except Exception as e:
+        log.warning(f"Daily note failed: {e}")
 
-# ---- Bootstrap App + Bot
-def build_application() -> Application:
-    b = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN)
-    if RATE_LIMITER:
-        b = b.rate_limiter(RATE_LIMITER)
-    app = b.build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ask", ask_cmd))
-    app.add_handler(CommandHandler("dev", dev_cmd))
-    app.add_handler(CommandHandler("tts", tts_cmd))
-    app.add_handler(CommandHandler("yt", yt_cmd))
-    app.add_handler(CommandHandler("img", img_cmd))
-    app.add_handler(CallbackQueryHandler(inline_cb))
-    # Generic text -> /ask
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ask_cmd))
-    return app
+# -------------------------
+# Telegram App bootstrap
+# -------------------------
+BOT_APPLICATION: Application | None = None
 
-async def run_all():
-    # Start scheduler
-    scheduler.start()
-    # Start Telegram
-    if not TELEGRAM_BOT_TOKEN:
-        log.warning("TELEGRAM_BOT_TOKEN missing — Telegram bot will not start.")
-    else:
-        application = build_application()
-        asyncio.create_task(application.initialize())
-        asyncio.create_task(application.start())
-        asyncio.create_task(application.updater.start_polling())
-        log.info("Telegram bot started (polling).")
+def get_bot_username_safe() -> str:
+    try:
+        if BOT_APPLICATION:
+            me = BOT_APPLICATION.bot.get_me()
+            return me.username or "YourBot"
+    except Exception:
+        pass
+    return "YourBot"
 
-    # Start Flask (ASGI via hypercorn/uvicorn would be ideal; here use built-in in a thread)
-    # Use waitress? Keep simple: run in a thread via asyncio.to_thread + Werkzeug dev server is blocking.
-    # We'll spin a thread for Flask using WSGI server from Werkzeug.
-    import threading
-    def _run_flask():
-        app.run(host="0.0.0.0", port=PORT)
-    t = threading.Thread(target=_run_flask, daemon=True)
+async def setup_bot_commands(app: Application):
+    cmds = [
+        BotCommand("start", "Welcome message"),
+        BotCommand("help", "How to use"),
+        BotCommand("ask", "Ask AI instantly"),
+        BotCommand("code", "Generate app/script code"),
+        BotCommand("balance", "Show revenue & usage"),
+        BotCommand("pro", "Pro features"),
+    ]
+    await app.bot.set_my_commands(cmds)
+
+def run_bot_polling():
+    """
+    Runs PTB in polling mode on a dedicated asyncio loop (thread).
+    Flask keeps the port open for Render. This is simplest + robust.
+    """
+    async def _run():
+        global BOT_APPLICATION
+        application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+        # Handlers
+        application.add_handler(CommandHandler("start", cmd_start))
+        application.add_handler(CommandHandler("help", cmd_help))
+        application.add_handler(CommandHandler("pro", cmd_pro))
+        application.add_handler(CommandHandler("balance", cmd_balance))
+        application.add_handler(CommandHandler("ask", cmd_ask))
+        application.add_handler(CommandHandler("code", cmd_code))
+        application.add_handler(CallbackQueryHandler(on_callback))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+        await setup_bot_commands(application)
+
+        BOT_APPLICATION = application
+        log.info("Telegram handlers registered.")
+        log.info("Mode: POLLING")
+        try:
+            await application.initialize()
+            await application.start()
+            await application.updater.start_polling(drop_pending_updates=True)
+            await application.updater.wait()
+        finally:
+            await application.stop()
+            await application.shutdown()
+
+    import asyncio
+    asyncio.run(_run())
+
+def maybe_set_webhook():
+    """
+    Use this only if you want Telegram to push updates to your server.
+    Since we're already polling and keeping Flask port open, webhook is optional.
+    If you prefer webhook, set env TELEGRAM_USE_WEBHOOK=1.
+    """
+    use_webhook = os.getenv("TELEGRAM_USE_WEBHOOK", "0") == "1"
+    if not use_webhook:
+        log.info("Skipping webhook setup (using polling).")
+        return
+    try:
+        from telegram.request import HTTPXRequest
+        req = HTTPXRequest(connect_timeout=20, read_timeout=20, write_timeout=20)
+        from telegram import Bot
+        bot = Bot(token=TELEGRAM_BOT_TOKEN, request=req)
+        webhook_url = f"{DOMAIN}/webhook/{SECRET_TOKEN}"
+        bot.delete_webhook(drop_pending_updates=True)
+        ok = bot.set_webhook(url=webhook_url, secret_token=SECRET_TOKEN)
+        if ok:
+            log.info(f"Webhook set to {webhook_url}")
+        else:
+            log.warning("Failed to set webhook (Telegram returned false).")
+    except Exception as e:
+        log.warning(f"Webhook setup failed: {e}")
+
+# -------------------------
+# Main entry
+# -------------------------
+def main():
+    log.info("Starting...")
+    db_init()
+
+    # Scheduler
+    try:
+        SCHED.add_job(job_heartbeat, "interval", minutes=60, id="heartbeat", replace_existing=True)
+        SCHED.add_job(job_daily_note, "cron", hour=18, minute=0, id="daily_note", replace_existing=True)
+        SCHED.start()
+    except Exception as e:
+        log.warning(f"Scheduler failed to start: {e}")
+
+    # Optional webhook setup (we still run polling unless TELEGRAM_USE_WEBHOOK=1)
+    maybe_set_webhook()
+
+    # Start Telegram polling in background thread
+    t = threading.Thread(target=run_bot_polling, name="polling-thread", daemon=True)
     t.start()
 
-    # Keep the event loop alive
-    while True:
-        await asyncio.sleep(3600)
-
-def main():
-    if not os.path.exists(DB_PATH):
-        ensure_schema()
-    log.info("Monster starting…")
-    try:
-        asyncio.run(run_all())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    # Start Flask (bind to PORT for Render)
+    log.info(f"Flask serving on 0.0.0.0:{PORT}")
+    app.run(host="0.0.0.0", port=PORT, debug=False)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
