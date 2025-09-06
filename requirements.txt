@@ -1,31 +1,56 @@
-python-telegram-bot[job-queue,rate-limiter]==21.6
-APScheduler==3.10.4
+# --- Core bot packages ---
+python-telegram-bot[webhooks]==21.6
 Flask==3.1.2
-yt-dlp==2025.9.5
-moviepy==2.2.1
+
+# --- Scheduler (daily jobs, reminders) ---
+APScheduler==3.10.4
+
+# --- Voice & Media ---
 gTTS==2.5.4
-openai==1.42.0
-python-dotenv==1.1.1
-requests==2.32.5
-numpy==2.3.2
-pillow==11.3.0
-tqdm==4.67.1
+moviepy==2.2.1
+yt-dlp==2025.9.5
 imageio==2.37.0
 imageio-ffmpeg==0.6.0
-jinja2==3.1.6
-Werkzeug==3.1.3
-blinker==1.9.0
-itsdangerous==2.2.0
-certifi==2025.8.3
-click==8.1.8
-decorator==5.2.1
-charset-normalizer==3.4.3
-idna==3.10
-urllib3==2.5.0
-sniffio==1.3.1
-anyio==4.10.0
+pillow==11.3.0
+numpy==2.3.2
+proglog==0.1.12
+
+# --- HTTP & Utils ---
+requests==2.32.5
 httpx==0.27.2
 httpcore==1.0.4
+urllib3==2.5.0
+charset-normalizer==3.4.3
+idna==3.10
+sniffio==1.3.1
+anyio==4.10.0
 typing-extensions==4.15.0
+typing-inspection==0.4.1
+
+# --- Env Config ---
+python-dotenv==1.1.1
+
+# --- OpenAI & AI Stuff ---
+openai==1.42.0
+distro==1.9.0
+jiter==0.10.0
+pydantic==2.11.7
+annotated-types==0.7.0
+pydantic-core==2.33.2
+
+# --- Timezone ---
 tzlocal==5.3.1
-proglog==0.1.12
+pytz==2025.2
+
+# --- Flask deps ---
+click==8.1.8
+itsdangerous==2.2.0
+jinja2==3.1.6
+markupsafe==3.0.2
+Werkzeug==3.1.3
+
+# --- Misc ---
+decorator==5.2.1
+blinker==1.9.0
+six==1.17.0
+tqdm==4.67.1
