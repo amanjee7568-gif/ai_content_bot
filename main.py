@@ -90,7 +90,7 @@ if not BOT_TOKEN or not OPENAI_API_KEY:
     logger.error("ENV MISSING: BOT_TOKEN and OPENAI_API_KEY must be set.")
     # continue so user can inspect; bot won't be functional until env set
 
-# Initialize OpenAI client - NOTE: no proxies argument
+# Initialize OpenAI client 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # -------------------- Simple SQLite DB for users/premium --------------------
