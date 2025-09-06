@@ -1,7 +1,8 @@
 python-telegram-bot[webhooks]==20.3
 openai==0.27.8
 Flask==3.1.2
-python-dotenv==1.0.0
+python-dotenv==1.1.1
 gTTS==2.5.4
-yt-dlp==2025.1.26
 moviepy==2.0.0
+yt-dlp @ git+https://github.com/yt-dlp/yt-dlp.git
+requests==2.32.3
