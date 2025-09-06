@@ -687,6 +687,10 @@ def main():
     else:
         logger.info("Starting polling (WEBHOOK_URL not set).")
         app.run_polling()
+        import os
+
+PORT = int(os.environ.get("PORT", 10000))
+app.run(host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
     main()
