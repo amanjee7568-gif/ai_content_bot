@@ -833,7 +833,7 @@ def build_application() -> Application:
     app = (
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
-        .rate_limiter(AIORateLimiter(max_retries=3))
+        #.rate_limiter(AIORateLimiter(max_retries=3))
         .concurrent_updates(True)
         .build()
     )
