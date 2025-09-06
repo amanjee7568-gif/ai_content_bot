@@ -1,803 +1,457 @@
-import os
-import re
-import json
-import time
-import uuid
-import base64
-import random
-import string
-import sqlite3 as sqlite
-import datetime as dt
-import threading
+# main.py
+# Single-file Flask + Telegram Webhook app (python-telegram-bot v21)
+# Works on Render. No polling/threads. Admin panel + home UI + OpenAI generation.
+
+import os, json, textwrap, asyncio, datetime as dt
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional
 
-import requests
+from flask import Flask, request, redirect, url_for, render_template_string, session, abort, flash
 from dotenv import load_dotenv
-from flask import Flask, request, jsonify, make_response, redirect, url_for, render_template_string, session, abort
 
-# Telegram v21.x
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.constants import ChatAction, ParseMode
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
+# --- Load ENV ---
+load_dotenv(dotenv_path=os.getenv("DOTENV_PATH") or ".env")
+
+# --------- Config ---------
+@dataclass
+class Config:
+    ADMIN_ID: Optional[str] = os.getenv("ADMIN_ID")
+    ADMIN_USER: str = os.getenv("ADMIN_USER", "admin")
+    ADMIN_PASS: str = os.getenv("ADMIN_PASS", "password")
+
+    BUSINESS_NAME: str = os.getenv("BUSINESS_NAME", "Ganesh A.I.")
+    BUSINESS_EMAIL: str = os.getenv("BUSINESS_EMAIL", "admin@example.com")
+    SUPPORT_USERNAME: str = os.getenv("SUPPORT_USERNAME", "@support")
+
+    DOMAIN: str = os.getenv("DOMAIN", "http://localhost:10000").rstrip("/")
+    PORT: int = int(os.getenv("PORT", os.getenv("port", "10000")))  # Render sets PORT
+
+    FLASK_SECRET: str = os.getenv("FLASK_SECRET", "change-me")
+    SECRET_TOKEN: str = os.getenv("SECRET_TOKEN", "set-a-random-secret")
+
+    OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY")
+    OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    TELEGRAM_BOT_TOKEN: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
+    WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "").rstrip("/")
+    TELEGRAM_WEBHOOK_SECRET: str = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+
+    ENABLE_SEARCH: str = os.getenv("ENABLE_SEARCH", "1")
+    SHOW_TOOLS: str = os.getenv("SHOW_TOOLS", "1")
+    DEFAULT_SOURCES: str = os.getenv("DEFAULT_SOURCES", "web")
+
+    # Optional / not strictly used here, but read safely
+    CASHFREE_APP_ID: str = os.getenv("CASHFREE_APP_ID", "")
+    CASHFREE_SECRET_KEY: str = os.getenv("CASHFREE_SECRET_KEY", "")
+    CASHFREE_WEBHOOK_SECRET: str = os.getenv("CASHFREE_WEBHOOK_SECRET", "")
+    UPI_ID: str = os.getenv("UPI_ID", "")
+    VISIT_PAY_RATE: str = os.getenv("VISIT_PAY_RATE", "0.0")
+
+    HUGGINGFACE_API_URL: str = os.getenv("HUGGINGFACE_API_URL", "")
+    HUGGINGFACE_API_TOKEN: str = os.getenv("HUGGINGFACE_API_TOKEN", "")
+
+CFG = Config()
+
+# ---- Safety checks for Webhook config ----
+if not CFG.WEBHOOK_URL:
+    # Fall back to DOMAIN if WEBHOOK_URL not provided
+    CFG.WEBHOOK_URL = CFG.DOMAIN
+
+# --------- Flask App ---------
+app = Flask(__name__)
+app.secret_key = CFG.FLASK_SECRET
+
+def y():
+    # current UTC year (no deprecated utcnow)
+    return dt.datetime.now(dt.UTC).year
+
+# --------- OpenAI Client ----------
+OPENAI_AVAILABLE = False
+try:
+    if CFG.OPENAI_API_KEY:
+        from openai import OpenAI
+        openai_client = OpenAI(api_key=CFG.OPENAI_API_KEY)
+        OPENAI_AVAILABLE = True
+except Exception as e:
+    OPENAI_AVAILABLE = False
+
+# --------- Telegram (v21) ----------
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, BotCommand
+
+tg_app: Optional[Application] = None
+if CFG.TELEGRAM_BOT_TOKEN:
+    tg_app = Application.builder().token(CFG.TELEGRAM_BOT_TOKEN).build()
+else:
+    print("WARN: TELEGRAM_BOT_TOKEN not set. Telegram bot disabled.")
+
+# --- Telegram Handlers ---
+WELCOME = (
+    "👋 *Welcome to Ganesh A.I. Assistant!*\n"
+    "Type your topic or question, and I’ll generate content.\n"
+    "Admin panel (web): `/admin` (on site)\n"
 )
 
-# Optional OpenAI (auto-fallback to HF if not present/configured)
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
+async def tg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_markdown_v2(WELCOME)
 
+async def tg_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Send me a topic. I’ll draft content using OpenAI.")
 
-# =========================
-# Env & Config
-# =========================
-load_dotenv()
+async def tg_echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = (update.message.text or "").strip()
+    if not user_text:
+        await update.message.reply_text("Send some text to generate content.")
+        return
+    draft = await ai_generate(user_text)
+    await update.message.reply_text(draft[:4000] or "No content generated.")
 
-APP_NAME = os.getenv("APP_NAME", "Ganesh A.I.")
-BRAND_DOMAIN = os.getenv("BRAND_DOMAIN", "https://brand.page/Ganeshagamingworld").rstrip("/")
-HUGGINGFACE_API_URL = os.getenv("HUGGINGFACE_API_URL", "").strip()
-HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()  # if key exists
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-FLASK_SECRET = os.getenv("FLASK_SECRET", os.urandom(24).hex())
-PORT = int(os.getenv("PORT", "10000"))
-HOST = os.getenv("HOST", "0.0.0.0")
-VISIT_PAY_RATE = float(os.getenv("VISIT_PAY_RATE", "0.001"))  # USD (or points) per unique visit hit
-COOKIE_VISIT_KEY = "ganesh_visit_token"
-COOKIE_VISIT_TTL = int(os.getenv("COOKIE_VISIT_TTL", "1800"))  # 30 mins
+if tg_app:
+    tg_app.add_handler(CommandHandler("start", tg_start))
+    tg_app.add_handler(CommandHandler("help", tg_help))
+    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, tg_echo))
 
-ADMIN_USER = os.getenv("ADMIN_USER", "admin")
-ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
-
-ENABLE_OPENAI = bool(OPENAI_API_KEY)
-ENABLE_HF = bool(HUGGINGFACE_API_URL and HUGGINGFACE_API_TOKEN)
-
-# =========================
-# Flask App
-# =========================
-app = Flask(__name__)
-app.secret_key = FLASK_SECRET
-
-
-# =========================
-# Database
-# =========================
-DB_PATH = os.getenv("DB_PATH", "ganesh_ai.db")
-
-SCHEMA = """
-PRAGMA journal_mode=WAL;
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    tg_user_id TEXT,
-    username TEXT,
-    first_name TEXT,
-    last_name TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    direction TEXT CHECK(direction IN ('in','out')),
-    content TEXT,
-    tokens INTEGER DEFAULT 0,
-    model TEXT,
-    cost REAL DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(user_id) REFERENCES users(id)
-);
-
-CREATE TABLE IF NOT EXISTS earnings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT,       -- 'visit','ads','affiliate','premium','donation','telegram'
-    amount REAL,       -- USD or points
-    note TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS metrics (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT,
-    value REAL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    level TEXT,
-    message TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-"""
-
-def db() -> sqlite.Connection:
-    conn = sqlite.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite.Row
-    return conn
-
-def ensure_db():
-    conn = db()
-    with conn:
-        # Python 3.12 deprecation note: default adapter warning is ok for SQLite
-        conn.executescript(SCHEMA)
-    conn.close()
-
-ensure_db()
-
-
-# =========================
-# Utilities
-# =========================
-def log(level: str, message: str):
+# --- Webhook boot sequence (initialize+start+set_webhook) ---
+async def _boot_telegram():
+    if not tg_app:
+        return
+    await tg_app.initialize()
+    await tg_app.start()
+    # set commands
     try:
-        conn = db()
-        with conn:
-            conn.execute("INSERT INTO logs(level, message) VALUES (?,?)", (level, message[:4000]))
-    except Exception as e:
-        print("LOG FAIL:", e)
-
-def metric(name: str, value: float = 1.0):
-    try:
-        conn = db()
-        with conn:
-            conn.execute("INSERT INTO metrics(name, value) VALUES (?,?)", (name, value))
-    except Exception as e:
-        log("ERROR", f"metric fail {name}: {e}")
-
-def earn(source: str, amount: float, note: str = ""):
-    try:
-        conn = db()
-        with conn:
-            conn.execute("INSERT INTO earnings(source, amount, note) VALUES (?,?,?)", (source, amount, note[:500]))
-    except Exception as e:
-        log("ERROR", f"earn fail {source}: {e}")
-
-def get_stats() -> Dict[str, Any]:
-    conn = db()
-    cur = conn.cursor()
-    out = {}
-    out["users"] = cur.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
-    out["messages"] = cur.execute("SELECT COUNT(*) c FROM messages").fetchone()["c"]
-    out["earnings"] = cur.execute("SELECT IFNULL(SUM(amount),0) s FROM earnings").fetchone()["s"] or 0.0
-    out["last_10_logs"] = [dict(r) for r in cur.execute("SELECT * FROM logs ORDER BY id DESC LIMIT 10").fetchall()]
-    out["last_10_earnings"] = [dict(r) for r in cur.execute("SELECT * FROM earnings ORDER BY id DESC LIMIT 10").fetchall()]
-    out["last_10_msgs"] = [dict(r) for r in cur.execute("SELECT * FROM messages ORDER BY id DESC LIMIT 10").fetchall()]
-    return out
-
-def upsert_user_by_tg(update: Update) -> int:
-    """Create/find user row by telegram user info; return user_id."""
-    if not update or not update.effective_user:
-        return 0
-    u = update.effective_user
-    tg_user_id = str(u.id)
-    conn = db()
-    cur = conn.cursor()
-    row = cur.execute("SELECT id FROM users WHERE tg_user_id=?", (tg_user_id,)).fetchone()
-    if row:
-        return row["id"]
-    with conn:
-        cur.execute(
-            "INSERT INTO users (tg_user_id, username, first_name, last_name) VALUES (?,?,?,?)",
-            (tg_user_id, u.username, u.first_name, u.last_name),
-        )
-    return cur.lastrowid
-
-def record_message(user_id: int, direction: str, content: str, tokens: int = 0, model: str = "", cost: float = 0.0):
-    try:
-        conn = db()
-        with conn:
-            conn.execute(
-                "INSERT INTO messages(user_id, direction, content, tokens, model, cost) VALUES (?,?,?,?,?,?)",
-                (user_id, direction, content[:8000], tokens, model, cost),
-            )
-    except Exception as e:
-        log("ERROR", f"record_message fail: {e}")
-
-# =========================
-# AI Core
-# =========================
-@dataclass
-class AIResponse:
-    text: str
-    model: str
-    tokens: int = 0
-    cost: float = 0.0
-
-# OpenAI client (optional)
-_oai_client = None
-if ENABLE_OPENAI and OpenAI is not None:
-    try:
-        _oai_client = OpenAI(api_key=OPENAI_API_KEY)
-        log("INFO", "OpenAI client initialized.")
-    except Exception as e:
-        log("ERROR", f"OpenAI init error: {e}")
-        _oai_client = None
-
-def _openai_chat(prompt: str, system: str = "You are a helpful AI assistant.") -> Optional[AIResponse]:
-    if not _oai_client:
-        return None
-    try:
-        resp = _oai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-        )
-        text = resp.choices[0].message.content or ""
-        usage = getattr(resp, "usage", None)
-        tokens = (usage.total_tokens if usage else 0) if hasattr(usage, "total_tokens") else 0
-        # Rough cost estimation can be added if needed
-        return AIResponse(text=text.strip(), model=OPENAI_MODEL, tokens=tokens, cost=0.0)
-    except Exception as e:
-        log("ERROR", f"OpenAI chat error: {e}")
-        return None
-
-def _hf_generate(prompt: str, max_new_tokens: int = 512, temperature: float = 0.7) -> Optional[AIResponse]:
-    if not ENABLE_HF:
-        return None
-    try:
-        headers = {
-            "Authorization": f"Bearer {HUGGINGFACE_API_TOKEN}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "inputs": prompt,
-            "parameters": {"max_new_tokens": max_new_tokens, "temperature": temperature},
-            "options": {"wait_for_model": True}
-        }
-        r = requests.post(HUGGINGFACE_API_URL, headers=headers, data=json.dumps(payload), timeout=60)
-        if r.status_code == 200:
-            data = r.json()
-            # HF inference endpoints vary; handle common shapes
-            if isinstance(data, list) and data and isinstance(data[0], dict) and "generated_text" in data[0]:
-                out = data[0]["generated_text"]
-            elif isinstance(data, dict) and "generated_text" in data:
-                out = data["generated_text"]
-            elif isinstance(data, dict) and "choices" in data and data["choices"]:
-                out = data["choices"][0].get("text", "")
-            else:
-                out = str(data)
-            return AIResponse(text=out.strip(), model="huggingface", tokens=0, cost=0.0)
-        else:
-            log("ERROR", f"HF bad status {r.status_code}: {r.text[:300]}")
-            return None
-    except Exception as e:
-        log("ERROR", f"HF generate error: {e}")
-        return None
-
-def smart_generate(prompt: str, system: str = "You are a helpful AI assistant.") -> AIResponse:
-    """Try OpenAI then HF as fallback."""
-    if ENABLE_OPENAI and _oai_client:
-        ans = _openai_chat(prompt, system=system)
-        if ans and ans.text:
-            return ans
-    # fallback HF
-    ans = _hf_generate(prompt)
-    if ans and ans.text:
-        return ans
-    # ultimate fallback
-    return AIResponse(text="(AI backend unavailable right now. Please try again in a moment.)", model="offline")
-
-
-def code_prompt(task: str) -> str:
-    return f"""You are a senior software engineer. Generate clean, production-ready code for this request:
-
-{task}
-
-Requirements:
-- Provide a complete solution in the requested language.
-- Add brief inline comments where helpful.
-- Avoid unnecessary boilerplate unless needed to run.
-"""
-
-def image_prompt(idea: str) -> str:
-    return f"""Create an image generation prompt suitable for an advanced text-to-image model.
-Describe the scene concisely but vividly.
-
-Idea: {idea}
-
-Output only the final prompt text, nothing else.
-"""
-
-
-# =========================
-# Monetization Helpers
-# =========================
-def unique_visit_credit(req) -> bool:
-    """Credit earning for unique visits using a cookie token + TTL."""
-    now = int(time.time())
-    token = request.cookies.get(COOKIE_VISIT_KEY)
-    already_counted = False
-    if token:
-        # store in memory? We'll record a metric; to keep it simple, rely on TTL cookie.
-        already_counted = True
-    resp = make_response()
-    if not already_counted:
-        earn("visit", VISIT_PAY_RATE, note=f"ip={req.remote_addr}")
-        metric("visit")
-        # set cookie
-        tok = base64.urlsafe_b64encode(os.urandom(12)).decode("utf-8").rstrip("=")
-        resp.set_cookie(COOKIE_VISIT_KEY, tok, max_age=COOKIE_VISIT_TTL, httponly=True, samesite="Lax")
-    return resp
-
-
-# =========================
-# HTML Templates
-# =========================
-def year_utc():
-    try:
-        return dt.datetime.now(dt.timezone.utc).year
+        await tg_app.bot.set_my_commands([
+            BotCommand("start", "Start the bot"),
+            BotCommand("help", "How to use"),
+        ])
     except Exception:
-        return dt.datetime.utcnow().year  # fallback
+        pass
+    # set webhook
+    secret = CFG.TELEGRAM_WEBHOOK_SECRET or CFG.SECRET_TOKEN
+    url = CFG.WEBHOOK_URL.rstrip("/") + f"/telegram/webhook/{secret}"
+    await tg_app.bot.set_webhook(url=url, allowed_updates=["message","callback_query"])
 
-BASE_HEAD = """
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>{{ title }}</title>
-<link rel="icon" href="data:,">
+# Run boot once on startup
+if tg_app:
+    try:
+        asyncio.run(_boot_telegram())
+        print("Telegram webhook set.")
+    except RuntimeError:
+        # If an event loop is already running (rare on WSGI), schedule it differently.
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(_boot_telegram())
+        loop.close()
+
+# ---------- HTML Templates ----------
+BASE_CSS = """
 <style>
-:root{--bg:#0b0f17;--fg:#e6eefb;--muted:#9fb3d1;--card:#111827;--acc:#7c3aed;}
+:root { --bg:#0b0f17; --card:#121826; --muted:#94a3b8; --txt:#e2e8f0; --acc:#60a5fa; }
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif}
-.container{max-width:1000px;margin:0 auto;padding:24px}
-nav{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
-.brand{font-weight:800;letter-spacing:.5px}
-a,button{cursor:pointer}
-.card{background:var(--card);border:1px solid #1f2937;border-radius:16px;padding:20px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
-h1{font-size:28px;margin:.2em 0}
-h2{font-size:22px;margin:.2em 0}
-small{color:var(--muted)}
-.input{width:100%;padding:12px 14px;border-radius:10px;border:1px solid #374151;background:#0f1623;color:var(--fg)}
-.btn{padding:10px 14px;border-radius:10px;border:1px solid #334155;background:#0d1421;color:#fff}
-.btn.primary{background:linear-gradient(90deg,#7c3aed,#2563eb);border:0}
-.row{display:grid;grid-template-columns:1fr;gap:16px}
-.ad{background:#0b1220;border:1px dashed #334155;border-radius:14px;padding:14px;text-align:center}
-footer{margin-top:36px;color:var(--muted);text-align:center}
-.table{width:100%;border-collapse:collapse;font-size:14px}
-.table th,.table td{border-bottom:1px solid #223049;padding:8px 6px;text-align:left}
-.kpi{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:12px 0}
-.kpi .card{padding:14px;text-align:center}
-.badge{display:inline-block;padding:4px 8px;border:1px solid #334155;border-radius:999px;font-size:12px;color:var(--muted)}
-.header-cta{display:flex;gap:8px;flex-wrap:wrap}
-@media (min-width:800px){
- .row{grid-template-columns:1.5fr .8fr}
-}
+body{margin:0;font-family:Inter,system-ui,Arial;background:linear-gradient(180deg,#0b0f17,#0f172a);}
+.wrap{max-width:1040px;margin:0 auto;padding:24px;}
+nav{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
+.brand{font-weight:700;color:#fff;font-size:20px;letter-spacing:.2px}
+.badge{color:#a3e635;background:#1d2538;border-radius:999px;padding:6px 10px;font-size:12px}
+.card{background:var(--card);border:1px solid #1f2937;border-radius:16px;padding:16px;box-shadow:0 10px 24px rgba(0,0,0,.25)}
+.row{display:grid;grid-template-columns:1fr 420px; gap:16px}
+textarea,input,button{width:100%;border-radius:12px;border:1px solid #23314d;background:#0f172a;color:var(--txt);padding:12px;font-size:14px;outline:none}
+button{background:linear-gradient(90deg,#2563eb,#7c3aed);border:none;font-weight:700;cursor:pointer}
+button:disabled{opacity:.5;cursor:not-allowed}
+h1{color:#fff;font-size:22px;margin:0 0 8px}
+label{display:block;color:var(--muted);font-size:12px;margin:6px 0}
+pre.output{white-space:pre-wrap;background:#0a0f1d;border:1px dashed #223; padding:12px;border-radius:12px;color:#cbd5e1;min-height:120px}
+.kv{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.kv span{background:#0b1222;border:1px solid #1e293b;border-radius:8px;padding:6px 10px;color:#9fb3c8;font-size:12px}
+footer{color:#64748b;text-align:center;margin-top:32px}
+a, a:visited{color:#93c5fd;text-decoration:none}
+.formline{display:flex;gap:8px}
+hr{border:none;border-top:1px solid #1f2937;margin:16px 0}
+.notice{color:#a5b4fc;font-size:12px}
 </style>
-<!-- Monetization/Ads placeholders (replace with your real tags) -->
-<!-- Google AdSense example placeholder -->
-<!-- <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-XXXX" crossorigin="anonymous"></script> -->
-<!-- Adsterra/Propeller etc. can be inserted here -->
 """
 
-INDEX_HTML = BASE_HEAD + """
+HOME_TMPL = f"""
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{CFG.BUSINESS_NAME}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{BASE_CSS}
+</head>
 <body>
-<div class="container">
+<div class="wrap">
   <nav>
-    <div class="brand">{{ brand }}</div>
-    <div class="header-cta">
-      <a class="btn" href="{{ brand_domain }}" target="_blank">Brand</a>
-      <a class="btn" href="/admin/login">Admin</a>
-      <a class="btn primary" href="#play">Try AI</a>
+    <div class="brand">{CFG.BUSINESS_NAME}</div>
+    <div class="kv">
+      <span>Admin: <a href="/admin">/admin</a></span>
+      <span>Support: {CFG.SUPPORT_USERNAME}</span>
     </div>
+  </nav>
+
+  <div class="row">
+    <div class="card">
+      <h1>Generate AI Content</h1>
+      <form method="post" action="/generate">
+        {% if env.ENABLE_SEARCH == '1' %}
+        <div class="formline">
+          <input type="text" name="topic" placeholder="Topic / Query" value="{{ topic or '' }}" required>
+          <button type="submit">Generate</button>
+        </div>
+        {% else %}
+        <label>Topic</label>
+        <input type="text" name="topic" placeholder="Topic / Query" value="{{ topic or '' }}" required>
+        <button type="submit" style="margin-top:10px">Generate</button>
+        {% endif %}
+        <label>Extra instructions (optional)</label>
+        <textarea name="instructions" rows="4" placeholder="Tone, target audience, outlines etc.">{{ instructions or '' }}</textarea>
+      </form>
+      <hr>
+      <label>Output</label>
+      <pre class="output">{{ output or '— your content will appear here —' }}</pre>
+      <div class="kv">
+        {% if env.SHOW_TOOLS == '1' %}
+        <span>Model: {{ model }}</span>
+        <span>Sources: {{ env.DEFAULT_SOURCES }}</span>
+        {% endif %}
+        <span>Webhook: /telegram/webhook/{{ env.TELEGRAM_WEBHOOK_SECRET or env.SECRET_TOKEN }}</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h1>How it works</h1>
+      <div class="notice">
+        • Uses OpenAI ({{ model }})<br>
+        • Telegram bot via webhook (no polling)<br>
+        • Admin panel at <code>/admin</code><br>
+        • Flags: ENABLE_SEARCH={{ env.ENABLE_SEARCH }}, SHOW_TOOLS={{ env.SHOW_TOOLS }}
+      </div>
+      <hr>
+      <div class="kv">
+        <span>Email: {CFG.BUSINESS_EMAIL}</span>
+        <span>UPI: {CFG.UPI_ID or '—'}</span>
+      </div>
+    </div>
+  </div>
+
+  <footer>© {y()} {CFG.BUSINESS_NAME}</footer>
+</div>
+</body>
+</html>
+"""
+
+ADMIN_TMPL = f"""
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{BASE_CSS}<title>Admin · {CFG.BUSINESS_NAME}</title></head>
+<body>
+<div class="wrap">
+  <nav>
+    <div class="brand">Admin · {CFG.BUSINESS_NAME}</div>
+    <div class="kv"><span><a href="/">Home</a></span><span><a href="/logout">Logout</a></span></div>
   </nav>
 
   <div class="card">
-    <h1>⚡ {{ brand }} — Ultra AI Assistant</h1>
-    <p>Ask anything. Get instant, high-quality answers. Code, scripts, app ideas, marketing copies, summaries — all in one.</p>
-    <div class="badge">Monetized • Visit credits active</div>
-  </div>
-
-  <div class="row" id="play" style="margin-top:16px">
-    <div class="card">
-      <h2>Chat</h2>
-      <form method="post" action="/api/ask" onsubmit="event.preventDefault(); askAI();">
-        <textarea class="input" id="prompt" name="prompt" rows="5" placeholder="Type your question, e.g., 'Build a Telegram bot that greets users...'"></textarea>
-        <div style="display:flex;gap:8px;margin-top:8px">
-          <button class="btn primary" id="askBtn" type="submit">Ask</button>
-          <button class="btn" type="button" onclick="fillCode()">Generate Code</button>
-          <button class="btn" type="button" onclick="fillImage()">Image Prompt</button>
-        </div>
-      </form>
-      <div id="ans" style="white-space:pre-wrap;margin-top:12px"></div>
+    <h1>Environment</h1>
+    <div class="kv">
+      <span>ENABLE_SEARCH={{ env.ENABLE_SEARCH }}</span>
+      <span>SHOW_TOOLS={{ env.SHOW_TOOLS }}</span>
+      <span>DEFAULT_SOURCES={{ env.DEFAULT_SOURCES }}</span>
+      <span>MODEL={{ model }}</span>
+      <span>WEBHOOK_URL={{ env.WEBHOOK_URL }}</span>
     </div>
-
-    <div class="card">
-      <h2>Monetization</h2>
-      <div class="ad">Ad Slot #1 (replace with your ad tag)</div>
-      <div class="ad">Ad Slot #2 (replace with your ad tag)</div>
-      <div class="ad">Affiliate: <a href="#" onclick="alert('Replace with your affiliate URL');return false;">Top AI Courses</a></div>
-      <small>Every unique visit gives you a micro-earning. Integrate your ad networks to scale.</small>
+    <hr>
+    <form method="post" action="/admin/actions">
+      <button name="action" value="set_webhook">Re-set Telegram Webhook</button>
+    </form>
+    <hr>
+    <div class="notice">
+      Webhook endpoint:
+      <code>{{ env.WEBHOOK_URL }}/telegram/webhook/{{ env.TELEGRAM_WEBHOOK_SECRET or env.SECRET_TOKEN }}</code>
     </div>
   </div>
 
-  <footer>© {{ year }} Ganesh A.I. • <a href="/health" style="color:#9fb3d1">health</a></footer>
-</div>
-
-<script>
-async function askAI(){
-  const btn = document.getElementById('askBtn');
-  const ans = document.getElementById('ans');
-  const prompt = document.getElementById('prompt').value.trim();
-  if(!prompt){ ans.textContent="Please type something."; return; }
-  btn.disabled = true; ans.textContent = "Thinking…";
-  try{
-    const r = await fetch('/api/ask', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({prompt})
-    });
-    const j = await r.json();
-    ans.textContent = j.text || "(no output)";
-  }catch(e){
-    ans.textContent = "Error: "+e;
-  }finally{
-    btn.disabled = false;
-  }
-}
-function fillCode(){ document.getElementById('prompt').value = "Create a FastAPI service with a /sum endpoint and Dockerfile."; }
-function fillImage(){ document.getElementById('prompt').value = "A cinematic cyberpunk street at night, neon rain, reflective puddles, ultra-detailed, 35mm, volumetric lighting."; }
-</script>
-</body>
-"""
-
-ADMIN_LOGIN_HTML = BASE_HEAD + """
-<body>
-<div class="container">
-  <nav>
-    <div class="brand">{{ brand }}</div>
-    <div class="header-cta">
-      <a class="btn" href="/">Home</a>
-    </div>
-  </nav>
-
-  <div class="card" style="max-width:460px;margin:0 auto">
-    <h2>Admin Login</h2>
-    {% if error %}<div class="ad" style="border-color:#7c3aed;color:#eab308">{{ error }}</div>{% endif %}
-    <form method="post">
-      <label>Username</label>
-      <input class="input" name="u" placeholder="username"/>
-      <label>Password</label>
-      <input class="input" type="password" name="p" placeholder="password"/>
-      <button class="btn primary" style="margin-top:10px">Login</button>
+  <div class="card">
+    <h1>Quick Generate (admin)</h1>
+    <form method="post" action="/generate">
+      <label>Topic</label>
+      <input type="text" name="topic" placeholder="e.g., YouTube script on AI news" required>
+      <label>Instructions</label>
+      <textarea name="instructions" rows="4" placeholder="Tone, target audience, bullets, CTA, etc."></textarea>
+      <button type="submit" style="margin-top:8px">Generate</button>
     </form>
   </div>
+
+  <footer>© {y()} {CFG.BUSINESS_NAME}</footer>
 </div>
 </body>
+</html>
 """
 
-ADMIN_DASH_HTML = BASE_HEAD + """
+LOGIN_TMPL = f"""
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{BASE_CSS}<title>Login · {CFG.BUSINESS_NAME}</title></head>
 <body>
-<div class="container">
-  <nav>
-    <div class="brand">{{ brand }}</div>
-    <div class="header-cta">
-      <span class="badge">Admin</span>
-      <a class="btn" href="/">Home</a>
-      <a class="btn" href="/admin/logout">Logout</a>
-    </div>
-  </nav>
-
-  <div class="kpi">
-    <div class="card"><div style="font-size:12px;color:#9fb3d1">Users</div><div style="font-size:24px">{{ users }}</div></div>
-    <div class="card"><div style="font-size:12px;color:#9fb3d1">Messages</div><div style="font-size:24px">{{ messages }}</div></div>
-    <div class="card"><div style="font-size:12px;color:#9fb3d1">Earnings</div><div style="font-size:24px">${{ "%.4f"|format(earnings) }}</div></div>
+<div class="wrap">
+  <nav><div class="brand">{CFG.BUSINESS_NAME} Admin</div></nav>
+  <div class="card">
+    <h1>Admin Login</h1>
+    <form method="post">
+      <label>Username</label>
+      <input name="username" required>
+      <label>Password</label>
+      <input name="password" type="password" required>
+      <button type="submit" style="margin-top:8px">Login</button>
+    </form>
+    {% with msgs = get_flashed_messages() %}
+      {% if msgs %}<hr><div class="notice">{{ msgs[0] }}</div>{% endif %}
+    {% endwith %}
   </div>
-
-  <div class="row" style="margin-top:10px">
-    <div class="card">
-      <h2>Recent Messages</h2>
-      <table class="table">
-        <tr><th>ID</th><th>User</th><th>Dir</th><th>Tokens</th><th>Model</th><th>At</th></tr>
-        {% for m in last_10_msgs %}
-          <tr>
-            <td>{{ m.id }}</td>
-            <td>{{ m.user_id }}</td>
-            <td>{{ m.direction }}</td>
-            <td>{{ m.tokens }}</td>
-            <td>{{ m.model }}</td>
-            <td>{{ m.created_at }}</td>
-          </tr>
-        {% endfor %}
-      </table>
-    </div>
-
-    <div class="card">
-      <h2>Recent Earnings</h2>
-      <table class="table">
-        <tr><th>ID</th><th>Source</th><th>Amount</th><th>Note</th><th>At</th></tr>
-        {% for e in last_10_earnings %}
-          <tr>
-            <td>{{ e.id }}</td>
-            <td>{{ e.source }}</td>
-            <td>${{ "%.6f"|format(e.amount) }}</td>
-            <td>{{ e.note }}</td>
-            <td>{{ e.created_at }}</td>
-          </tr>
-        {% endfor %}
-      </table>
-      <form method="post" action="/admin/mock-earning" style="margin-top:8px">
-        <div style="display:flex;gap:6px;align-items:center">
-          <input class="input" name="amount" placeholder="0.10"/>
-          <input class="input" name="source" placeholder="test"/>
-          <button class="btn">+ Add earning</button>
-        </div>
-      </form>
-    </div>
-  </div>
-
-  <div class="card" style="margin-top:12px">
-    <h2>Logs</h2>
-    <table class="table">
-      <tr><th>ID</th><th>Level</th><th>Message</th><th>At</th></tr>
-      {% for l in last_10_logs %}
-        <tr>
-          <td>{{ l.id }}</td>
-          <td>{{ l.level }}</td>
-          <td style="max-width:560px;white-space:pre-wrap">{{ l.message }}</td>
-          <td>{{ l.created_at }}</td>
-        </tr>
-      {% endfor %}
-    </table>
-  </div>
-
+  <footer>© {y()} {CFG.BUSINESS_NAME}</footer>
 </div>
 </body>
+</html>
 """
 
-# =========================
-# Flask Routes
-# =========================
-@app.before_request
-def _track_visit():
-    """Credit per unique visit (cookie)."""
+# ---------- AI generation ----------
+async def ai_generate_async(topic: str, instructions: str = "") -> str:
+    if not OPENAI_AVAILABLE:
+        return "OpenAI API key not configured. Please set OPENAI_API_KEY."
+    prompt = textwrap.dedent(f"""
+    You are Ganesh A.I. Write a helpful, structured response.
+
+    Topic: {topic}
+    Extra instructions: {instructions or "N/A"}
+
+    Requirements:
+    - Clear intro, useful bullets, and a short CTA at the end.
+    - Keep it concise but actionable.
+    """).strip()
+
     try:
-        if request.endpoint in ("static",):
-            return
-        # only for GET on primary pages
-        if request.method == "GET" and request.path in ("/", "/index.html"):
-            resp = unique_visit_credit(request)
-            if isinstance(resp, type(make_response())):
-                # merged response with index render; handled in index()
-                pass
+        # OpenAI v1 chat.completions
+        resp = openai_client.chat.completions.create(
+            model=CFG.OPENAI_MODEL,
+            messages=[
+                {"role":"system","content":"You are a concise, helpful, multilingual content writer."},
+                {"role":"user","content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=700,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+        return out or "No content generated."
     except Exception as e:
-        log("ERROR", f"visit track error: {e}")
+        return f"AI error: {e}"
 
-@app.route("/", methods=["GET"])
-def index():
-    # build response + maybe set cookie if new visit
-    base = render_template_string(
-        INDEX_HTML,
-        title=f"{APP_NAME} — Ultra AI",
-        brand=APP_NAME,
-        brand_domain=BRAND_DOMAIN,
-        year=year_utc(),
-    )
-    resp = unique_visit_credit(request)
-    if resp and hasattr(resp, "set_cookie"):
-        resp.response = [base]
-        resp.headers["Content-Type"] = "text/html; charset=utf-8"
-        return resp
-    return base
+def ai_generate(topic: str, instructions: str = "") -> str:
+    # Helper to run async in sync Flask views
+    try:
+        return asyncio.run(ai_generate_async(topic, instructions))
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        out = loop.run_until_complete(ai_generate_async(topic, instructions))
+        loop.close()
+        return out
 
-@app.route("/health")
-def health():
-    return jsonify({"ok": True, "time": int(time.time())})
-
-@app.route("/api/ask", methods=["POST"])
-def api_ask():
-    data = request.get_json(force=True, silent=True) or {}
-    prompt = (data.get("prompt") or "").strip()
-    if not prompt:
-        return jsonify({"ok": False, "error": "empty prompt"}), 400
-    metric("ask_api")
-    sys = "You are Ganesh A.I., the most helpful multilingual assistant. Keep answers concise but complete."
-    ai = smart_generate(prompt, system=sys)
-    # Record as anonymous user_id 0 (web)
-    record_message(0, "in", prompt)
-    record_message(0, "out", ai.text, tokens=ai.tokens, model=ai.model, cost=ai.cost)
-    # small earning per interaction (optional)
-    earn("web_chat", 0.0002, "api ask")
-    return jsonify({"ok": True, "text": ai.text, "model": ai.model})
-
-# simple pixel endpoints for affiliate/cpa postback simulations
-@app.route("/pixel/hit")
-def pixel_hit():
-    metric("pixel_hit")
-    earn("pixel", 0.0001, note=f"q={dict(request.args)}")
-    return ("", 204)
-
-# ========== Admin ==========
-def _is_admin() -> bool:
-    return bool(session.get("admin_ok") is True)
-
-@app.route("/admin/login", methods=["GET", "POST"])
-def admin_login():
-    err = None
-    if request.method == "POST":
-        u = request.form.get("u", "")
-        p = request.form.get("p", "")
-        if u == ADMIN_USER and p == ADMIN_PASS:
-            session["admin_ok"] = True
-            return redirect("/admin/dashboard")
-        else:
-            err = "Invalid credentials"
-    return render_template_string(ADMIN_LOGIN_HTML, title=f"{APP_NAME} Admin", brand=APP_NAME, error=err)
-
-@app.route("/admin/logout")
-def admin_logout():
-    session.pop("admin_ok", None)
-    return redirect("/")
-
-@app.route("/admin/dashboard")
-def admin_dashboard():
-    if not _is_admin():
-        return redirect("/admin/login")
-    s = get_stats()
+# ---------- Routes ----------
+@app.get("/")
+def home():
     return render_template_string(
-        ADMIN_DASH_HTML,
-        title=f"{APP_NAME} Admin",
-        brand=APP_NAME,
-        users=s["users"],
-        messages=s["messages"],
-        earnings=s["earnings"],
-        last_10_logs=s["last_10_logs"],
-        last_10_earnings=s["last_10_earnings"],
-        last_10_msgs=s["last_10_msgs"],
+        HOME_TMPL,
+        env=CFG.__dict__,
+        model=CFG.OPENAI_MODEL,
+        topic="",
+        instructions="",
+        output=""
     )
 
-@app.route("/admin/mock-earning", methods=["POST"])
-def admin_mock_earning():
-    if not _is_admin():
-        return redirect("/admin/login")
-    try:
-        amt = float(request.form.get("amount", "0") or "0")
-        src = (request.form.get("source", "test") or "test")[:32]
-        earn(src, amt, "manual")
-    except Exception as e:
-        log("ERROR", f"mock earning err: {e}")
-    return redirect("/admin/dashboard")
-
-
-# =========================
-# Telegram Bot Handlers
-# =========================
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    metric("tg_start")
-    user_id = upsert_user_by_tg(update)
-    text = (
-        f"👋 Welcome to *{APP_NAME}*!\n"
-        "Ask anything (tech, code, business, marketing, school). I reply instantly.\n\n"
-        "Commands:\n"
-        "• /help — features list\n"
-        "• /code <task> — generate production-ready code\n"
-        "• /imagine <idea> — image prompt for TTI models\n"
-        "• /stats — usage summary\n\n"
-        "Tip: just send a message to chat freely."
+@app.post("/generate")
+def generate():
+    topic = (request.form.get("topic") or "").strip()
+    instructions = (request.form.get("instructions") or "").strip()
+    if not topic:
+        flash("Please enter a topic.")
+        return redirect(url_for("home"))
+    out = ai_generate(topic, instructions)
+    return render_template_string(
+        HOME_TMPL,
+        env=CFG.__dict__,
+        model=CFG.OPENAI_MODEL,
+        topic=topic,
+        instructions=instructions,
+        output=out
     )
-    await update.effective_message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-    earn("telegram", 0.0001, "start")
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    metric("tg_help")
-    text = (
-        "🧠 *Features*\n"
-        "• Chat like ChatGPT (multilingual)\n"
-        "• Code generation `/code`\n"
-        "• Image prompt maker `/imagine`\n"
-        "• Monetization + Admin Panel (web)\n"
-        f"• Web app: {BRAND_DOMAIN}\n"
-    )
-    await update.effective_message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+# --- Admin auth helpers ---
+def is_authed() -> bool:
+    return session.get("authed") is True
 
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    s = get_stats()
-    msg = (
-        f"📊 *Stats*\nUsers: {s['users']}\nMessages: {s['messages']}\n"
-        f"Earnings: ${s['earnings']:.4f}"
-    )
-    await update.effective_message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+@app.route("/admin", methods=["GET","POST"])
+def admin():
+    if request.method == "POST":
+        u = request.form.get("username","")
+        p = request.form.get("password","")
+        if u == CFG.ADMIN_USER and p == CFG.ADMIN_PASS:
+            session["authed"] = True
+            return redirect(url_for("admin"))
+        flash("Invalid credentials.")
+        return render_template_string(LOGIN_TMPL)
+    # GET
+    if not is_authed():
+        return render_template_string(LOGIN_TMPL)
+    return render_template_string(ADMIN_TMPL, env=CFG.__dict__, model=CFG.OPENAI_MODEL)
 
-async def cmd_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = upsert_user_by_tg(update)
-    task = " ".join(context.args) if context.args else ""
-    if not task:
-        await update.effective_message.reply_text("Usage: `/code your requirement here`", parse_mode=ParseMode.MARKDOWN)
-        return
-    await update.effective_chat.send_action(ChatAction.TYPING)
-    p = code_prompt(task)
-    ai = smart_generate(p, system="You are a senior software engineer.")
-    record_message(user_id, "in", task)
-    record_message(user_id, "out", ai.text, model=ai.model, tokens=ai.tokens, cost=ai.cost)
-    earn("telegram", 0.0002, "code")
-    await update.effective_message.reply_text(ai.text[:4096])
-
-async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = upsert_user_by_tg(update)
-    idea = " ".join(context.args) if context.args else ""
-    if not idea:
-        await update.effective_message.reply_text("Usage: `/imagine a cute robot in rainforest`", parse_mode=ParseMode.MARKDOWN)
-        return
-    await update.effective_chat.send_action(ChatAction.TYPING)
-    p = image_prompt(idea)
-    ai = smart_generate(p, system="You are a world-class prompt engineer for image models.")
-    record_message(user_id, "in", idea)
-    record_message(user_id, "out", ai.text, model=ai.model, tokens=ai.tokens, cost=ai.cost)
-    earn("telegram", 0.0002, "imagine")
-    await update.effective_message.reply_text("🖼️ Use this prompt in your favorite image generator:\n\n" + ai.text[:3900])
-
-async def tg_free_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = upsert_user_by_tg(update)
-    q = update.effective_message.text or ""
-    if not q.strip():
-        return
-    await update.effective_chat.send_action(ChatAction.TYPING)
-    ai = smart_generate(q, system="You are Ganesh A.I., extremely helpful and concise.")
-    record_message(user_id, "in", q)
-    record_message(user_id, "out", ai.text, model=ai.model, tokens=ai.tokens, cost=ai.cost)
-    earn("telegram", 0.00015, "chat")
-    await update.effective_message.reply_text(ai.text[:4096])
-
-async def cb_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # currently not used; kept for future inline keyboards
-    q = update.callback_query
-    if q:
-        await q.answer("Working…")
-        await q.edit_message_text("Action handled.")
-
-
-def build_application():
-    if not TELEGRAM_BOT_TOKEN:
-        log("WARNING", "TELEGRAM_BOT_TOKEN missing; bot will not start.")
-        return None
-    appb = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    appb.add_handler(CommandHandler("start", cmd_start))
-    appb.add_handler(CommandHandler("help", cmd_help))
-    appb.add_handler(CommandHandler("stats", cmd_stats))
-    appb.add_handler(CommandHandler("code", cmd_code))
-    appb.add_handler(CommandHandler("imagine", cmd_imagine))
-    appb.add_handler(CallbackQueryHandler(cb_action))
-    # free text chat
-    appb.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, tg_free_chat))
-    return appb
-
-
-# =========================
-# Boot: Run Flask + Telegram
-# =========================
-import asyncio
-
-def run_telegram_in_thread():
-    application = build_application()
-    if application is None:
-        log("INFO", "Telegram not configured; skipping bot start.")
-        return
-
-    def _runner():
+@app.post("/admin/actions")
+def admin_actions():
+    if not is_authed():
+        abort(403)
+    action = request.form.get("action","")
+    if action == "set_webhook":
+        if not tg_app:
+            flash("Telegram not configured.")
+            return redirect(url_for("admin"))
+        async def _do():
+            secret = CFG.TELEGRAM_WEBHOOK_SECRET or CFG.SECRET_TOKEN
+            url = CFG.WEBHOOK_URL.rstrip("/") + f"/telegram/webhook/{secret}"
+            await tg_app.bot.set_webhook(url=url, allowed_updates=["message","callback_query"])
         try:
-            asyncio.run(application.run_polling(allowed_updates=Update.ALL_TYPES))
+            asyncio.run(_do())
+            flash("Webhook updated.")
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(_do())
+            loop.close()
+            flash("Webhook updated.")
+    return redirect(url_for("admin"))
+
+@app.get("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("admin"))
+
+# --- Telegram webhook endpoint ---
+@app.post(f"/telegram/webhook/{CFG.TELEGRAM_WEBHOOK_SECRET or CFG.SECRET_TOKEN}")
+def telegram_webhook():
+    if not tg_app:
+        return "Bot not configured", 200
+    if request.headers.get("Content-Type","").startswith("application/json"):
+        try:
+            data = request.get_json(force=True, silent=False)
+            update = Update.de_json(data, tg_app.bot)
+            # Run processing synchronously (creates a short-lived loop)
+            asyncio.run(tg_app.process_update(update))
+            return "OK", 200
         except Exception as e:
-            log("ERROR", f"telegram thread crash: {e}")
+            print("Webhook error:", e)
+            return "ERR", 200
+    abort(415)
 
-    t = threading.Thread(target=_runner, name="tg-polling", daemon=True)
-    t.start()
-    log("INFO", "Telegram polling thread started.")
+@app.get("/healthz")
+def health():
+    return {"ok": True, "ts": dt.datetime.now(dt.UTC).isoformat(), "app": "Ganesh-AI"}, 200
 
-def main():
-    log("INFO", f"{APP_NAME} booting...")
-    # Start Telegram
-    run_telegram_in_thread()
-    # Start Flask (must bind PORT for Render)
-    app.run(host=HOST, port=PORT)
-
+# --- Entry ---
 if __name__ == "__main__":
-    main()
+    print(f"Starting {CFG.BUSINESS_NAME} on port {CFG.PORT} …")
+    app.run(host="0.0.0.0", port=CFG.PORT, debug=False)
