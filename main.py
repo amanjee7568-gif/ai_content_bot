@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
-# main.py — Full working AI Content Creator Telegram Bot
-# Requirements: see requirements.txt (openai==1.42.0, httpx==0.27.2, httpcore==1.0.4, python-telegram-bot==21.6, ...)
-# ENV (must set in Render / hosting):
-#   BOT_TOKEN, OPENAI_API_KEY, ADMIN_ID (numeric), WEBHOOK_URL (optional)
-# optional: BUSINESS_NAME, BUSINESS_EMAIL, SUPPORT_USERNAME, UPI_ID
+"""
+Production-ready Telegram AI Content Bot - main.py
+
+Requirements (example pinned versions):
+  openai==1.42.0
+  httpx==0.27.2
+  httpcore==1.0.4
+  python-telegram-bot[webhooks,jobs]==21.6
+  yt-dlp
+  moviepy
+  gTTS
+  APScheduler
+  Flask
+  requests
+  imageio-ffmpeg
+"""
 
 import os
 import sys
@@ -11,28 +22,17 @@ import logging
 import sqlite3
 import random
 import tempfile
-import subprocess
+import traceback
 from datetime import datetime, timedelta
 from typing import Optional
 
-# -------------------- Optional runtime installs (best-effort) --------------------
-def _ensure(pkg):
-    try:
-        __import__(pkg)
-    except Exception:
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
-        except Exception:
-            pass
-
-# -------------------- Core libs --------------------
 import requests
 from gtts import gTTS
 
-# OpenAI new SDK (ensure openai==1.42.0 in requirements)
+# OpenAI new SDK
 from openai import OpenAI
 
-# Telegram
+# Telegram imports
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
@@ -49,32 +49,30 @@ from telegram.ext import (
     filters,
 )
 
-# Video / audio helpers (moviepy optional)
+# Optional: moviepy for video creation
 try:
     from moviepy.editor import ColorClip, CompositeVideoClip, AudioFileClip, TextClip
     MOVIEPY_AVAILABLE = True
 except Exception:
     MOVIEPY_AVAILABLE = False
 
-# yt-dlp optional
+# Optional: yt-dlp for YouTube downloads
 try:
     import yt_dlp
 except Exception:
     yt_dlp = None
 
-# Scheduler (APScheduler)
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# -------------------- Logging --------------------
+# ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ai_content_bot")
 
-# -------------------- Config from ENV --------------------
-# Keep variable names compatible with your previous deploys
-BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")  # accept both
+# ---------------- Config (ENV) ----------------
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # e.g. https://ai-content-bot-xxxxx.onrender.com
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # e.g. https://your-app.onrender.com
 PORT = int(os.getenv("PORT", os.getenv("RENDER_PORT", "10000")))
 
 BUSINESS_NAME = os.getenv("BUSINESS_NAME", "AI Content Agency")
@@ -82,20 +80,26 @@ BUSINESS_EMAIL = os.getenv("BUSINESS_EMAIL", "")
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@support")
 UPI_ID = os.getenv("UPI_ID", "")
 
-if not BOT_TOKEN or not OPENAI_API_KEY:
-    logger.error("ENV MISSING: BOT_TOKEN and OPENAI_API_KEY must be set.")
-    # do not exit immediately; keep running for inspection (but many features will fail)
+DB_FILE = os.getenv("DB_FILE", "bot_data.db")
 
-# Initialize OpenAI client - NOTE: no proxies argument, uses new SDK
+if not BOT_TOKEN:
+    logger.error("BOT_TOKEN (or TELEGRAM_TOKEN) environment variable is required.")
+if not OPENAI_API_KEY:
+    logger.error("OPENAI_API_KEY environment variable is required.")
+
+# Initialize OpenAI client safely
+openai_client: Optional[OpenAI] = None
 try:
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    if OPENAI_API_KEY:
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        logger.info("OpenAI client initialized.")
+    else:
+        logger.warning("OPENAI_API_KEY not set — OpenAI features will be disabled.")
 except Exception as e:
     logger.exception("Failed to initialize OpenAI client: %s", e)
     openai_client = None
 
-# -------------------- Simple SQLite DB for users/premium --------------------
-DB_FILE = os.getenv("DB_FILE", "bot_data.db")
-
+# ---------------- Database helpers ----------------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
@@ -129,7 +133,7 @@ def add_user(user_id: int, first_name: str = "", username: str = ""):
                     (user_id, first_name, username))
         conn.commit()
     except Exception:
-        logger.exception("add_user error")
+        logger.exception("add_user failed")
     finally:
         try: conn.close()
         except: pass
@@ -156,11 +160,9 @@ def is_premium(user_id: int) -> bool:
     cur.execute("SELECT is_premium, expiry FROM users WHERE user_id=?", (user_id,))
     r = cur.fetchone()
     conn.close()
-    if not r:
-        return False
+    if not r: return False
     active, expiry = r
-    if not active:
-        return False
+    if not active: return False
     if expiry:
         try:
             exp_dt = datetime.strptime(expiry, "%Y-%m-%d %H:%M:%S")
@@ -191,7 +193,7 @@ def stats():
     total, prem = row
     return int(total or 0), int(prem or 0)
 
-# -------------------- Ads rotation --------------------
+# ---------------- Small UX utils ----------------
 ADS = [
     "🔥 Sponsored: Try our premium AI tools!",
     "💡 Learn more — business solutions available.",
@@ -200,7 +202,6 @@ ADS = [
 def ad():
     return random.choice(ADS)
 
-# -------------------- Persistent Reply Keyboard (Main menu + Back) --------------------
 MAIN_MENU = [
     [KeyboardButton("🤖 AI Chat"), KeyboardButton("🎙 Voice Reply")],
     [KeyboardButton("🎬 Create Video"), KeyboardButton("🖼 AI Image")],
@@ -215,10 +216,10 @@ def main_menu_markup():
 def back_markup():
     return ReplyKeyboardMarkup(BACK_BUTTON, resize_keyboard=True, one_time_keyboard=True)
 
-# -------------------- OpenAI helpers (new SDK) --------------------
+# ---------------- OpenAI helpers ----------------
 def ai_chat(prompt: str, system: Optional[str] = None, max_tokens: int = 400) -> str:
     if openai_client is None:
-        return "⚠️ OpenAI client not initialized."
+        return "⚠️ OpenAI not configured."
     try:
         messages = []
         if system:
@@ -230,36 +231,30 @@ def ai_chat(prompt: str, system: Optional[str] = None, max_tokens: int = 400) ->
             max_tokens=max_tokens,
             temperature=0.8,
         )
-        # resp may be object-like or dict-like; handle both
         try:
             return resp.choices[0].message.content.strip()
         except Exception:
-            # dict-like fallback
             return resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
     except Exception as e:
-        logger.exception("OpenAI chat error")
+        logger.exception("ai_chat error: %s", e)
         return f"⚠️ OpenAI error: {e}"
 
-def openai_image(prompt: str) -> Optional[str]:
+def openai_image(prompt: str, size: str = "512x512") -> Optional[str]:
     if openai_client is None:
         return None
     try:
-        res = openai_client.images.generate(prompt=prompt, size="512x512")
+        res = openai_client.images.generate(prompt=prompt, size=size)
         if hasattr(res, "data") and len(res.data) > 0:
             return getattr(res.data[0], "url", None) or res.data[0].get("url")
         if isinstance(res, dict):
             return res.get("data", [{}])[0].get("url")
         return None
-    except Exception as e:
-        logger.exception("OpenAI image error")
+    except Exception:
+        logger.exception("openai_image error")
         return None
 
-# -------------------- Media helpers --------------------
+# ---------------- Media helpers ----------------
 def create_video_from_text(text: str, out_path: str = "output.mp4", duration: int = 8) -> Optional[str]:
-    """
-    If moviepy available, produce simple vertical video with text + TTS audio.
-    Else fallback: produce mp3 TTS file path.
-    """
     try:
         if not MOVIEPY_AVAILABLE:
             tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
@@ -267,7 +262,6 @@ def create_video_from_text(text: str, out_path: str = "output.mp4", duration: in
             tts.save(tmp.name)
             return tmp.name
 
-        # create TTS audio
         audio_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
         tts = gTTS(text=text, lang="hi")
         tts.save(audio_file)
@@ -285,38 +279,54 @@ def create_video_from_text(text: str, out_path: str = "output.mp4", duration: in
         try: os.remove(audio_file)
         except: pass
         return out_path
-    except Exception as e:
-        logger.exception("create_video error")
+    except Exception:
+        logger.exception("create_video_from_text error")
         return None
 
 def download_youtube(url: str) -> Optional[str]:
+    """
+    Uses yt_dlp to download highest-quality mp4. Returns file path or None.
+    If yt_dlp not available, returns None.
+    """
     if not yt_dlp:
-        logger.warning("yt-dlp not installed")
+        logger.warning("yt-dlp not available in environment.")
         return None
+
+    tmpdir = tempfile.gettempdir()
+    outtmpl = os.path.join(tmpdir, "ai_bot_yt.%(ext)s")
+    ydl_opts = {
+        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4/best",
+        "outtmpl": outtmpl,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "merge_output_format": "mp4",
+    }
     try:
-        tmpdir = tempfile.gettempdir()
-        outtmpl = os.path.join(tmpdir, "ai_bot_yt.%(ext)s")
-        ydl_opts = {
-            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4/best",
-            "outtmpl": outtmpl,
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-        }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
+            # yt_dlp may create .mkv etc; try to find actual file
+            if os.path.exists(filename):
+                return filename
+            # try common extensions
+            for ext in ("mp4", "mkv", "webm", "m4a"):
+                path = filename.rsplit(".", 1)[0] + "." + ext
+                if os.path.exists(path):
+                    return path
             return filename
-    except Exception as e:
-        logger.exception("yt-dlp error")
+    except Exception:
+        logger.exception("download_youtube error")
         return None
 
-# -------------------- Telegram Handlers --------------------
+# ---------------- Telegram Handlers ----------------
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     add_user(user.id, user.first_name or "", user.username or "")
-    text = (f"👋 नमस्ते *{user.first_name or 'User'}*!\n\n"
-            f"Welcome to *{BUSINESS_NAME}* — AI Content Creator Bot.\nChoose from menu below.")
+    text = (
+        f"👋 नमस्ते *{user.first_name or 'User'}*!\n\n"
+        f"Welcome to *{BUSINESS_NAME}* — AI Content Creator Bot.\nChoose from menu below."
+    )
     try:
         await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_markup())
         await update.message.reply_text(ad())
@@ -326,7 +336,6 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ping_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Bot is online.", reply_markup=main_menu_markup())
 
-# Central router for persistent keyboard
 async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     user = update.effective_user
@@ -412,9 +421,9 @@ async def handle_voice_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tts = gTTS(text=reply, lang="hi")
         tts.save(tmp.name)
         await update.message.reply_voice(voice=open(tmp.name, "rb"), caption=ad(), reply_markup=main_menu_markup())
-    except Exception as e:
-        logger.exception("voice error")
-        await update.message.reply_text("⚠️ Voice generation failed: " + str(e), reply_markup=main_menu_markup())
+    except Exception:
+        logger.exception("voice generation failed")
+        await update.message.reply_text("⚠️ Voice generation failed.", reply_markup=main_menu_markup())
     finally:
         try: os.remove(tmp.name)
         except: pass
@@ -434,9 +443,9 @@ async def handle_create_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_audio(audio=open(media_path, "rb"), caption=script + "\n\n" + ad(), reply_markup=main_menu_markup())
         else:
             await update.message.reply_video(video=open(media_path, "rb"), caption=script + "\n\n" + ad(), reply_markup=main_menu_markup())
-    except Exception as e:
-        logger.exception("send media error")
-        await update.message.reply_text("⚠️ Could not send media: " + str(e) + "\n\nHere is script:\n" + script, reply_markup=main_menu_markup())
+    except Exception:
+        logger.exception("sending created media failed")
+        await update.message.reply_text("⚠️ Could not send media. Here is script:\n\n" + script, reply_markup=main_menu_markup())
     finally:
         try: os.remove(media_path)
         except: pass
@@ -451,6 +460,7 @@ async def handle_image_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await update.message.reply_photo(photo=url, caption=f"Image for: {prompt}\n\n{ad()}", reply_markup=main_menu_markup())
         except Exception:
+            # fallback: download and send
             try:
                 r = requests.get(url, stream=True, timeout=30)
                 tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
@@ -458,9 +468,9 @@ async def handle_image_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     for chunk in r.iter_content(1024):
                         f.write(chunk)
                 await update.message.reply_photo(photo=open(tmp.name, "rb"), caption=f"Image for: {prompt}\n\n{ad()}", reply_markup=main_menu_markup())
-            except Exception as e:
+            except Exception:
                 logger.exception("image fallback error")
-                await update.message.reply_text("⚠️ Could not send image: " + str(e), reply_markup=main_menu_markup())
+                await update.message.reply_text("⚠️ Could not send image.", reply_markup=main_menu_markup())
             finally:
                 try: os.remove(tmp.name)
                 except: pass
@@ -474,12 +484,14 @@ async def handle_yt_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📥 Downloading video — may take a while.")
     path = download_youtube(url)
     if not path:
-        await update.message.reply_text("⚠️ Download failed or yt-dlp unavailable.", reply_markup=main_menu_markup()); return
+        # graceful fallback: don't crash — tell user why and provide link
+        await update.message.reply_text("⚠️ Download failed or yt-dlp unavailable. You can try the original link or try again later.\n\nLink: " + url, reply_markup=main_menu_markup())
+        return
     try:
         await update.message.reply_video(video=open(path, "rb"), caption=ad(), reply_markup=main_menu_markup())
-    except Exception as e:
-        logger.exception("yt send error")
-        await update.message.reply_text("⚠️ Could not send video: " + str(e) + f"\nSaved at {path}", reply_markup=main_menu_markup())
+    except Exception:
+        logger.exception("sending downloaded video failed")
+        await update.message.reply_text("⚠️ Could not send video. Saved at: " + path, reply_markup=main_menu_markup())
     finally:
         try: os.remove(path)
         except: pass
@@ -489,13 +501,16 @@ async def handle_support_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = update.effective_user
     msg = f"📩 Support from @{user.username or 'N/A'} (ID:{user.id}):\n\n{text}"
     try:
-        await context.bot.send_message(chat_id=ADMIN_ID, text=msg)
-        await update.message.reply_text("✅ Sent to admin.", reply_markup=main_menu_markup())
-    except Exception as e:
+        if ADMIN_ID:
+            await context.bot.send_message(chat_id=ADMIN_ID, text=msg)
+            await update.message.reply_text("✅ Sent to admin.", reply_markup=main_menu_markup())
+        else:
+            await update.message.reply_text("⚠️ Admin not configured. Contact support.", reply_markup=main_menu_markup())
+    except Exception:
         logger.exception("support forward error")
-        await update.message.reply_text("⚠️ Could not forward to admin: " + str(e), reply_markup=main_menu_markup())
+        await update.message.reply_text("⚠️ Could not forward to admin.", reply_markup=main_menu_markup())
 
-# ---------- Direct command handlers ----------
+# Direct command handlers
 async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /ai <text>", reply_markup=main_menu_markup()); return
@@ -515,9 +530,9 @@ async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tts = gTTS(text=reply, lang="hi")
         tts.save(tmp.name)
         await update.message.reply_voice(voice=open(tmp.name, "rb"), caption=ad(), reply_markup=main_menu_markup())
-    except Exception as e:
+    except Exception:
         logger.exception("cmd_voice error")
-        await update.message.reply_text("⚠️ Voice error: " + str(e), reply_markup=main_menu_markup())
+        await update.message.reply_text("⚠️ Voice error.", reply_markup=main_menu_markup())
     finally:
         try: os.remove(tmp.name)
         except: pass
@@ -536,9 +551,9 @@ async def cmd_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_audio(audio=open(out, "rb"), caption=script + "\n\n" + ad(), reply_markup=main_menu_markup())
         else:
             await update.message.reply_video(video=open(out, "rb"), caption=script + "\n\n" + ad(), reply_markup=main_menu_markup())
-    except Exception as e:
+    except Exception:
         logger.exception("cmd_create send error")
-        await update.message.reply_text("⚠️ Sending media failed: " + str(e), reply_markup=main_menu_markup())
+        await update.message.reply_text("⚠️ Sending media failed.", reply_markup=main_menu_markup())
     finally:
         try: os.remove(out)
         except: pass
@@ -564,9 +579,9 @@ async def cmd_yt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Download failed.", reply_markup=main_menu_markup()); return
     try:
         await update.message.reply_video(video=open(path, "rb"), caption=ad(), reply_markup=main_menu_markup())
-    except Exception as e:
+    except Exception:
         logger.exception("cmd_yt send error")
-        await update.message.reply_text("⚠️ Could not send video: " + str(e), reply_markup=main_menu_markup())
+        await update.message.reply_text("⚠️ Could not send video.", reply_markup=main_menu_markup())
     finally:
         try: os.remove(path)
         except: pass
@@ -582,11 +597,10 @@ async def cmd_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"⭐ Premium — ₹{amount}/30 days\nAfter payment, send screenshot to support to activate.", reply_markup=main_menu_markup())
     await update.message.reply_text("Choose payment method:", reply_markup=InlineKeyboardMarkup(kb))
 
-# -------------------- Admin --------------------
+# Admin handlers
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("Unauthorized.")
-        return
+        await update.message.reply_text("Unauthorized."); return
     kb = [
         [InlineKeyboardButton("👥 Users Stats", callback_data="admin_stats"), InlineKeyboardButton("💎 Manage Premium", callback_data="admin_premium")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"), InlineKeyboardButton("🔙 Back", callback_data="admin_back")]
@@ -609,8 +623,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def addpremium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /addpremium <user_id> <days>")
-        return
+        await update.message.reply_text("Usage: /addpremium <user_id> <days>"); return
     uid = int(context.args[0]); days = int(context.args[1])
     set_premium(uid, days)
     await update.message.reply_text(f"✅ Set premium for {uid} for {days} days.")
@@ -624,8 +637,7 @@ async def removepremium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     if not context.args:
-        await update.message.reply_text("Usage: /broadcast <message>")
-        return
+        await update.message.reply_text("Usage: /broadcast <message>"); return
     msg = " ".join(context.args)
     users = all_users()
     sent = 0
@@ -637,7 +649,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     await update.message.reply_text(f"Broadcast sent to {sent} users.")
 
-# -------------------- Daily premium check job (APScheduler) --------------------
+# Daily job
 def daily_check(app: Application):
     logger.info("Running daily premium check job.")
     conn = sqlite3.connect(DB_FILE)
@@ -665,13 +677,12 @@ def daily_check(app: Application):
                 pass
     conn.close()
 
-# -------------------- App setup & run --------------------
+# ---------------- App setup & run ----------------
 def main():
     init_db()
-    # Build application
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Commands & handlers
+    # Register handlers
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("ping", ping_handler))
 
@@ -689,17 +700,17 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router))
 
-    # Start APScheduler and schedule daily_check with app reference
+    # Scheduler
     sched = BackgroundScheduler()
     sched.add_job(lambda: daily_check(app), "cron", hour=9, minute=0)
     sched.start()
     logger.info("Scheduler started.")
 
-    # Webhook mode (Render) — uses BOT_TOKEN as URL path for security if WEBHOOK_URL set
+    # Start webhook (if WEBHOOK_URL set) else polling
     try:
         if WEBHOOK_URL:
             logger.info("Starting webhook on port %s", PORT)
-            # Run webhook with the given port and URL
+            # Use BOT_TOKEN as url_path for basic security
             app.run_webhook(
                 listen="0.0.0.0",
                 port=PORT,
@@ -709,8 +720,8 @@ def main():
         else:
             logger.info("Starting polling (WEBHOOK_URL not set).")
             app.run_polling()
-    except Exception as e:
-        logger.exception("Failed to start Telegram application: %s", e)
+    except Exception:
+        logger.exception("Failed to start Telegram application:\n%s", traceback.format_exc())
 
 if __name__ == "__main__":
     main()
