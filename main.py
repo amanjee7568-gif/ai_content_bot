@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# main.py — Production-ready AI Content Creator Telegram Bot
-# Requirements: python-telegram-bot[webhooks,jobs]==21.6, openai>=1.0, yt-dlp, moviepy, gTTS, APScheduler, Flask, requests
+# main.py — Full working AI Content Creator Telegram Bot
+# Requirements: see requirements.txt (openai==1.42.0, httpx==0.27.2, httpcore==1.0.4, python-telegram-bot==21.6, ...)
 # ENV (must set in Render / hosting):
-#   BOT_TOKEN, OPENAI_API_KEY, ADMIN_ID (numeric), WEBHOOK_URL (https://<your-service>.onrender.com)
+#   BOT_TOKEN, OPENAI_API_KEY, ADMIN_ID (numeric), WEBHOOK_URL (optional)
 # optional: BUSINESS_NAME, BUSINESS_EMAIL, SUPPORT_USERNAME, UPI_ID
 
 import os
@@ -16,7 +16,6 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 # -------------------- Optional runtime installs (best-effort) --------------------
-# (Used to attempt to auto-install some libs if missing on weird hosts.)
 def _ensure(pkg):
     try:
         __import__(pkg)
@@ -26,15 +25,11 @@ def _ensure(pkg):
         except Exception:
             pass
 
-# (You can remove the ensure calls if you rely on requirements.txt)
-# _ensure("yt_dlp")
-# _ensure("moviepy")
-
 # -------------------- Core libs --------------------
 import requests
 from gtts import gTTS
 
-# OpenAI new SDK
+# OpenAI new SDK (ensure openai==1.42.0 in requirements)
 from openai import OpenAI
 
 # Telegram
@@ -75,7 +70,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # -------------------- Config from ENV --------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# Keep variable names compatible with your previous deploys
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")  # accept both
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # e.g. https://ai-content-bot-xxxxx.onrender.com
@@ -88,13 +84,17 @@ UPI_ID = os.getenv("UPI_ID", "")
 
 if not BOT_TOKEN or not OPENAI_API_KEY:
     logger.error("ENV MISSING: BOT_TOKEN and OPENAI_API_KEY must be set.")
-    # continue so user can inspect; bot won't be functional until env set
+    # do not exit immediately; keep running for inspection (but many features will fail)
 
-# Initialize OpenAI client 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+# Initialize OpenAI client - NOTE: no proxies argument, uses new SDK
+try:
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+except Exception as e:
+    logger.exception("Failed to initialize OpenAI client: %s", e)
+    openai_client = None
 
 # -------------------- Simple SQLite DB for users/premium --------------------
-DB_FILE = "bot_data.db"
+DB_FILE = os.getenv("DB_FILE", "bot_data.db")
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -122,12 +122,17 @@ def init_db():
     conn.close()
 
 def add_user(user_id: int, first_name: str = "", username: str = ""):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO users (user_id, first_name, username) VALUES (?, ?, ?)",
-                (user_id, first_name, username))
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO users (user_id, first_name, username) VALUES (?, ?, ?)",
+                    (user_id, first_name, username))
+        conn.commit()
+    except Exception:
+        logger.exception("add_user error")
+    finally:
+        try: conn.close()
+        except: pass
 
 def set_premium(user_id: int, days: int = 30):
     expiry = (datetime.utcnow() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
@@ -179,8 +184,11 @@ def stats():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*), SUM(is_premium) FROM users")
-    total, prem = cur.fetchone()
+    row = cur.fetchone()
     conn.close()
+    if not row:
+        return 0, 0
+    total, prem = row
     return int(total or 0), int(prem or 0)
 
 # -------------------- Ads rotation --------------------
@@ -209,6 +217,8 @@ def back_markup():
 
 # -------------------- OpenAI helpers (new SDK) --------------------
 def ai_chat(prompt: str, system: Optional[str] = None, max_tokens: int = 400) -> str:
+    if openai_client is None:
+        return "⚠️ OpenAI client not initialized."
     try:
         messages = []
         if system:
@@ -220,15 +230,21 @@ def ai_chat(prompt: str, system: Optional[str] = None, max_tokens: int = 400) ->
             max_tokens=max_tokens,
             temperature=0.8,
         )
-        return resp.choices[0].message.content.strip()
+        # resp may be object-like or dict-like; handle both
+        try:
+            return resp.choices[0].message.content.strip()
+        except Exception:
+            # dict-like fallback
+            return resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
     except Exception as e:
         logger.exception("OpenAI chat error")
         return f"⚠️ OpenAI error: {e}"
 
 def openai_image(prompt: str) -> Optional[str]:
+    if openai_client is None:
+        return None
     try:
         res = openai_client.images.generate(prompt=prompt, size="512x512")
-        # try common response shapes
         if hasattr(res, "data") and len(res.data) > 0:
             return getattr(res.data[0], "url", None) or res.data[0].get("url")
         if isinstance(res, dict):
@@ -301,8 +317,11 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_user(user.id, user.first_name or "", user.username or "")
     text = (f"👋 नमस्ते *{user.first_name or 'User'}*!\n\n"
             f"Welcome to *{BUSINESS_NAME}* — AI Content Creator Bot.\nChoose from menu below.")
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_markup())
-    await update.message.reply_text(ad())
+    try:
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_markup())
+        await update.message.reply_text(ad())
+    except Exception:
+        logger.exception("start_handler reply failed")
 
 async def ping_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Bot is online.", reply_markup=main_menu_markup())
@@ -614,7 +633,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(u, f"📢 {msg}")
             sent += 1
-        except:
+        except Exception:
             pass
     await update.message.reply_text(f"Broadcast sent to {sent} users.")
 
@@ -636,19 +655,20 @@ def daily_check(app: Application):
         if 0 <= (exp_dt - now).days <= 1:
             try:
                 app.bot.send_message(uid, "⏰ Reminder: Your premium expires soon. Renew with /premium")
-            except:
+            except Exception:
                 pass
         if now > exp_dt:
             remove_premium(uid)
             try:
                 app.bot.send_message(uid, "⚠️ Your premium has expired.")
-            except:
+            except Exception:
                 pass
     conn.close()
 
 # -------------------- App setup & run --------------------
 def main():
     init_db()
+    # Build application
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Commands & handlers
@@ -675,22 +695,22 @@ def main():
     sched.start()
     logger.info("Scheduler started.")
 
-    # Webhook mode (Render) — uses BOT_TOKEN as URL path for security
-    if WEBHOOK_URL:
-        logger.info("Starting webhook on port %s", PORT)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=BOT_TOKEN,
-            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
-        )
-    else:
-        logger.info("Starting polling (WEBHOOK_URL not set).")
-        app.run_polling()
-        import os
-
-PORT = int(os.environ.get("PORT", 10000))
-app.run(host="0.0.0.0", port=PORT)
+    # Webhook mode (Render) — uses BOT_TOKEN as URL path for security if WEBHOOK_URL set
+    try:
+        if WEBHOOK_URL:
+            logger.info("Starting webhook on port %s", PORT)
+            # Run webhook with the given port and URL
+            app.run_webhook(
+                listen="0.0.0.0",
+                port=PORT,
+                url_path=BOT_TOKEN,
+                webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
+            )
+        else:
+            logger.info("Starting polling (WEBHOOK_URL not set).")
+            app.run_polling()
+    except Exception as e:
+        logger.exception("Failed to start Telegram application: %s", e)
 
 if __name__ == "__main__":
     main()
