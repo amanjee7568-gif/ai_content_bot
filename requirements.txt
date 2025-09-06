@@ -2,6 +2,7 @@ openai==1.42.0
 httpx==0.27.2
 httpcore==1.0.4
 python-telegram-bot[webhooks,jobs]==21.6
+tiktoken
 yt-dlp
 moviepy
 gTTS
