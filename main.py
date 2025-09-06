@@ -594,7 +594,6 @@ def escape_md(s: str) -> str:
 # --------- Main build ----------
 def build_application():
     appb = ApplicationBuilder().token(TELEGRAM_TOKEN)
-    # Optional AIORateLimiter
     try:
         appb = appb.rate_limiter(AIORateLimiter(max_retries=3))
         log.info("Rate limiter enabled.")
@@ -624,10 +623,10 @@ def build_application():
     application.add_handler(CommandHandler("set_premium_link", set_premium_link_cmd))
     application.add_handler(CommandHandler("set_referral_payout", set_referral_payout_cmd))
 
-    # Buttons
-    application.add_handler(
-        MessageHandler(filters.StatusUpdate.WEB_APP_DATA | filters.UpdateType.CALLBACK_QUERY, cb_action)
-    )
+    # ✅ Fix: use CallbackQueryHandler instead of UpdateType
+    application.add_handler(CallbackQueryHandler(cb_action))
+
+    # Fallback plain text
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text))
 
     return application
