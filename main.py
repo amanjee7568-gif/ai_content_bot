@@ -3554,20 +3554,19 @@ def paypal_webhook():
         _payments_db.session.commit()
 
     return "ok", 200
-
-# --------------------------------
+# -------------------------------------------------------
 # OPTIONAL: MANUAL CAPTURE (PayPal)
-# --------------------------------
+# -------------------------------------------------------
 @billing_bp.route("/api/paypal/capture/<order_id>", methods=["POST"])
 def paypal_capture(order_id):
     base, token = _paypal_base_and_token()
     if not token:
-        return jsonify({"error":"paypal auth fail"}), 400
+        return jsonify({"error": "paypal auth fail"}), 400
     r = requests.post(f"{base}/v2/checkout/orders/{order_id}/capture",
                       headers={"Authorization": f"Bearer {token}"},
                       json={}, timeout=20)
-    if r.status_code not in (200,201):
-        return jsonify({"error":"capture failed","detail":r.text}), 400
+    if r.status_code not in (200, 201):
+        return jsonify({"error": "capture failed", "detail": r.text}), 400
     resp = r.json()
     # mark local if needed
     pay = Payment.query.filter_by(provider="paypal", provider_order_id=order_id).order_by(Payment.id.desc()).first()
@@ -3578,12 +3577,17 @@ def paypal_capture(order_id):
         _credit_wallet(pay.ext_user_id, pay.amount_cents)
     return jsonify(resp)
 
-# --------------------------------
-# HEALTH
-# --------------------------------
+
+# -------------------------------------------------------
+# HEALTH CHECK
+# -------------------------------------------------------
 @billing_bp.route("/payments/health", methods=["GET"])
 def payments_health():
     return jsonify({"ok": True, "time": _utcnow_str()})
-    
-  if __name__ == "__main__":
+
+
+# -------------------------------------------------------
+# APP ENTRY POINT
+# -------------------------------------------------------
+if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
