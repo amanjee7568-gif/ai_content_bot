@@ -1,12 +1,24 @@
+
 <!DOCTYPE html>
 <html>
-<head>
-    <title>Dashboard - Ganesh A.I.</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-</head>
+<head><title>Dashboard</title></head>
 <body>
-    <h2>👤 Welcome {{ username }}!</h2>
-    <p>This is your dashboard.</p>
-    <a href="/">Go Home</a>
+  <h2>Hello {{ user['username'] }}</h2>
+  <p>Wallet: {{ user['wallet'] }}</p>
+  <form method="POST" action="{{ url_for('wallet_topup') }}">
+    <input name="amount" placeholder="Amount"><br>
+    <select name="provider">
+      <option value="stripe">Stripe</option>
+      <option value="paypal">PayPal</option>
+      <option value="cashfree">Cashfree</option>
+    </select><br>
+    <button type="submit">Topup</button>
+  </form>
+  <h3>Your Payments</h3>
+  <ul>
+  {% for p in payments %}
+    <li>{{ p['provider'] }} | {{ p['amount'] }} | {{ p['status'] }}</li>
+  {% endfor %}
+  </ul>
 </body>
 </html>

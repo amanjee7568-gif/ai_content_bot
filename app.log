@@ -1,0 +1,41 @@
+2025-09-07 21:29:55,228 | INFO | apscheduler.scheduler | Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2025-09-07 21:29:55,229 | INFO | apscheduler.scheduler | Added job "daily_log" to job store "default"
+2025-09-07 21:29:55,229 | INFO | apscheduler.scheduler | Scheduler started
+/workspace/project/ai_content_bot/main.py:119: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  "time": datetime.utcnow().isoformat()
+2025-09-07 21:29:55,235 | INFO | Ganesh A.I. | {"section": "database", "msg": "Database initialized successfully", "extra": {}, "time": "2025-09-07T21:29:55.235825"}
+2025-09-07 21:29:55,235 | INFO | Ganesh A.I. | {"section": "system", "msg": "Ganesh A.I. starting...", "extra": {}, "time": "2025-09-07T21:29:55.235905"}
+2025-09-07 21:29:55,249 | INFO | Ganesh A.I. | {"section": "telegram", "msg": "Telegram bot setup completed", "extra": {}, "time": "2025-09-07T21:29:55.249077"}
+2025-09-07 21:29:55,249 | INFO | Ganesh A.I. | {"section": "telegram", "msg": "Telegram bot configured (webhook mode)", "extra": {}, "time": "2025-09-07T21:29:55.249266"}
+ * Serving Flask app 'main'
+ * Debug mode: off
+2025-09-07 21:29:55,252 | INFO | werkzeug | [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:10000
+ * Running on http://10.2.7.11:10000
+2025-09-07 21:29:55,252 | INFO | werkzeug | [33mPress CTRL+C to quit[0m
+2025-09-07 21:30:02,593 | INFO | werkzeug | 127.0.0.1 - - [07/Sep/2025 21:30:02] "[32mGET /admin HTTP/1.1[0m" 302 -
+2025-09-07 21:30:06,465 | INFO | werkzeug | 127.0.0.1 - - [07/Sep/2025 21:30:06] "[32mGET /admin HTTP/1.1[0m" 302 -
+2025-09-07 21:30:11,516 | INFO | werkzeug | 127.0.0.1 - - [07/Sep/2025 21:30:11] "[32mPOST /api/generate HTTP/1.1[0m" 302 -
+2025-09-07 21:32:13,109 | INFO | werkzeug | 127.0.0.1 - - [07/Sep/2025 21:32:13] "GET / HTTP/1.1" 200 -
+2025-09-07 21:32:13,614 | INFO | werkzeug | 127.0.0.1 - - [07/Sep/2025 21:32:13] "GET / HTTP/1.1" 200 -
+2025-09-07 21:32:14,118 | INFO | werkzeug | 127.0.0.1 - - [07/Sep/2025 21:32:14] "GET /login HTTP/1.1" 200 -
+2025-09-07 21:32:14,122 | INFO | werkzeug | 127.0.0.1 - - [07/Sep/2025 21:32:14] "GET /register HTTP/1.1" 200 -
+2025-09-07 21:32:14,625 | INFO | werkzeug | 127.0.0.1 - - [07/Sep/2025 21:32:14] "[32mGET /admin HTTP/1.1[0m" 302 -
+2025-09-07 21:32:15,128 | INFO | werkzeug | 127.0.0.1 - - [07/Sep/2025 21:32:15] "[32mPOST /api/generate HTTP/1.1[0m" 302 -
+2025-09-07 21:32:15,631 | INFO | werkzeug | 127.0.0.1 - - [07/Sep/2025 21:32:15] "POST /webhook/telegram HTTP/1.1" 200 -
+Exception in thread Thread-12 (process_update):
+Traceback (most recent call last):
+  File "/openhands/micromamba/envs/openhands/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+    self.run()
+  File "/openhands/micromamba/envs/openhands/lib/python3.12/threading.py", line 1012, in run
+    self._target(*self._args, **self._kwargs)
+  File "/workspace/project/ai_content_bot/main.py", line 1106, in process_update
+    if update.message:
+       ^^^^^^^^^^^^^^
+AttributeError: 'NoneType' object has no attribute 'message'
+2025-09-07 21:32:15,633 | INFO | werkzeug | 127.0.0.1 - - [07/Sep/2025 21:32:15] "POST /webhook/cashfree HTTP/1.1" 200 -
+2025-09-07 21:32:15,635 | INFO | werkzeug | 127.0.0.1 - - [07/Sep/2025 21:32:15] "POST /webhook/paypal HTTP/1.1" 200 -
+2025-09-07 21:32:16,139 | INFO | werkzeug | 127.0.0.1 - - [07/Sep/2025 21:32:16] "GET /login HTTP/1.1" 200 -
+2025-09-07 21:32:17,147 | INFO | werkzeug | 127.0.0.1 - - [07/Sep/2025 21:32:17] "[33mGET /static/style.css HTTP/1.1[0m" 404 -
+2025-09-07 21:32:17,149 | INFO | werkzeug | 127.0.0.1 - - [07/Sep/2025 21:32:17] "[33mGET /static/script.js HTTP/1.1[0m" 404 -
