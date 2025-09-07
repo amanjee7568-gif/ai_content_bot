@@ -3511,16 +3511,15 @@ def payments_health():
 # END OF PART-16B
 # -------------------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 10000))
-    base_url = os.getenv("RENDER_EXTERNAL_URL")
+    # Flask app start
+    port = int(os.environ.get("PORT", 10000))
 
-    logger.info(
-        {
-            "section": "system",
-            "msg": "Ganesh A.I. starting...",
-            "extra": {},
-            "time": datetime.now(timezone.utc).isoformat(),
-        }
-    )
+    # Telegram webhook setup
+    WEBHOOK_URL = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/webhook"
+
+    application.bot.delete_webhook()
+    application.bot.set_webhook(WEBHOOK_URL)
+
+    logger.info(f"Webhook set to {WEBHOOK_URL}")
 
     app.run(host="0.0.0.0", port=port)
