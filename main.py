@@ -32,6 +32,12 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 
+from payments import (
+    create_stripe_payment,
+    create_razorpay_order,
+    create_paypal_order,
+    create_cashfree_order
+)
 # =========================
 # ENV & CONFIG
 # =========================
@@ -3577,7 +3583,39 @@ def paypal_capture(order_id):
         _credit_wallet(pay.ext_user_id, pay.amount_cents)
     return jsonify(resp)
 
+from payments import create_stripe_payment, create_razorpay_order, create_paypal_order, create_cashfree_order
 
+@app.route("/create-payment/stripe", methods=["POST"])
+def stripe_payment():
+    data = request.json
+    amount = float(data["amount"])
+    secret = create_stripe_payment(amount)
+    return jsonify({"client_secret": secret})
+
+@app.route("/create-payment/razorpay", methods=["POST"])
+def razorpay_payment():
+    data = request.json
+    amount = float(data["amount"])
+    order = create_razorpay_order(amount)
+    return jsonify(order)
+
+@app.route("/create-payment/paypal", methods=["POST"])
+def paypal_payment():
+    data = request.json
+    amount = float(data["amount"])
+    order = create_paypal_order(amount)
+    return jsonify(order)
+
+@app.route("/create-payment/cashfree", methods=["POST"])
+async def cashfree_payment():
+    data = request.json
+    order = await create_cashfree_order(
+        order_id=data["order_id"],
+        amount=float(data["amount"]),
+        email=data["email"],
+        phone=data["phone"]
+    )
+    return jsonify(order)
 # -------------------------------------------------------
 # HEALTH CHECK
 # -------------------------------------------------------
