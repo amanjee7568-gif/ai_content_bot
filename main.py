@@ -32,12 +32,6 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from payments import (
-    create_stripe_payment,
-    create_razorpay_order,
-    create_paypal_order,
-    create_cashfree_order
-)
 # =========================
 # ENV & CONFIG
 # =========================
@@ -1014,7 +1008,7 @@ with open("templates/admin/dashboard.html","w") as f: f.write(admin_html)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
-    # ============================
+# ============================
 # PART-5: PAYMENT BACKEND
 # ============================
 
@@ -1954,7 +1948,7 @@ def init_auto_agent():
         log_event("AUTO-AGENT", "Auto Agent initialized successfully.")
     except Exception as e:
         log_event("AUTO-AGENT", f"Initialization failed: {e}")
-       # ======================= PART-13: PAYMENTS + EARNINGS =======================
+        # ======================= PART-13: PAYMENTS + EARNINGS =======================
 # Drop-in: Add this whole block once, then register blueprint: app.register_blueprint(payments_bp)
 # Uses ENV from your ai_content_bot.env: CASHFREE_*, DOMAIN, SQLITE_PATH, ADMIN_USER/PASS, etc.
 
@@ -2848,7 +2842,7 @@ def admin_commission():
 #   PAYPAL_ENV=SANDBOX             # SANDBOX or LIVE
 #
 #   # PUBLIC_URL (for redirects/webhooks, e.g., https://yourdomain.com)
-#   PUBLIC_URL=https://ai-content-bot-bppk.onrender.com
+#   PUBLIC_URL=https://yourapp.onrender.com
 #
 # Hooks for your existing app:
 # - Register blueprint: app.register_blueprint(billing_bp)
@@ -2860,14 +2854,14 @@ def admin_commission():
 # - This is a minimal-yet-practical prod-style scaffold. Review before going live.
 # ===============================================
 
-import os, hmac, hashlib, json, base64, time, uuid
+import os, hmac, hashlib, json, base64, uuid
 from datetime import datetime, timezone
 from functools import wraps
 
 import requests
 from flask import (
-    Blueprint, request, jsonify, current_app, redirect,
-    render_template_string, url_for, abort
+    Blueprint, request, jsonify, render_template_string,
+    abort
 )
 
 # --- SQLAlchemy setup (self-contained) ---
@@ -2886,10 +2880,9 @@ def _utcnow_str():
 class WalletUser(_payments_db.Model):
     __tablename__ = "wallet_users"
     id = _payments_db.Column(_payments_db.Integer, primary_key=True)
-    # Your external system user_id; here we allow string to support telegram/own ids
     ext_user_id = _payments_db.Column(_payments_db.String(128), unique=True, nullable=False)
     display_name = _payments_db.Column(_payments_db.String(128), default="")
-    balance_cents = _payments_db.Column(_payments_db.Integer, default=0)  # store in minor units (paise/cents)
+    balance_cents = _payments_db.Column(_payments_db.Integer, default=0)
     created_at = _payments_db.Column(_payments_db.String(32), default=_utcnow_str)
     updated_at = _payments_db.Column(_payments_db.String(32), default=_utcnow_str)
 
@@ -2900,23 +2893,17 @@ class WalletUser(_payments_db.Model):
 class Payment(_payments_db.Model):
     __tablename__ = "payments"
     id = _payments_db.Column(_payments_db.Integer, primary_key=True)
-    # your app user
     ext_user_id = _payments_db.Column(_payments_db.String(128), nullable=False)
-
-    # common fields
-    provider = _payments_db.Column(_payments_db.String(32), nullable=False)  # 'razorpay' | 'cashfree' | 'paypal'
+    provider = _payments_db.Column(_payments_db.String(32), nullable=False)  # razorpay|cashfree|paypal
     currency = _payments_db.Column(_payments_db.String(8), nullable=False, default="INR")
     amount_cents = _payments_db.Column(_payments_db.Integer, nullable=False, default=0)
-    status = _payments_db.Column(_payments_db.String(32), nullable=False, default="created")  # created|pending|paid|failed|refunded
-    # external ids
+    status = _payments_db.Column(_payments_db.String(32), nullable=False, default="created")
     provider_order_id = _payments_db.Column(_payments_db.String(128), default="")
     provider_payment_id = _payments_db.Column(_payments_db.String(128), default="")
     provider_signature = _payments_db.Column(_payments_db.Text, default="")
     raw_payload = _payments_db.Column(_payments_db.Text, default="")
     created_at = _payments_db.Column(_payments_db.String(32), default=_utcnow_str)
     updated_at = _payments_db.Column(_payments_db.String(32), default=_utcnow_str)
-
-    # idempotency key for creates
     idem_key = _payments_db.Column(_payments_db.String(64), default="")
 
 # --------------------------------
@@ -2928,14 +2915,11 @@ billing_bp = Blueprint("billing", __name__)
 # CONFIG HELPERS
 # -------------------------
 def cfg(key, default=None):
-    v = os.environ.get(key, default)
-    return v
+    return os.environ.get(key, default)
 
 def payments_init_app(app):
-    """Bind SQLAlchemy to app (if not already), create tables."""
     global _DB_BOUND
     if not app.config.get("SQLALCHEMY_DATABASE_URI"):
-        # Default to sqlite file
         app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL", "sqlite:///payments.sqlite3")
     app.config.setdefault("SQLALCHEMY_TRACK_MODIFICATIONS", False)
     if not _DB_BOUND:
@@ -2957,7 +2941,6 @@ def require_admin(func):
 # UTIL
 # -------------------------
 def minor_units(amount_float: float, currency: str) -> int:
-    # For INR/USD etc, 2 decimals -> *100
     return int(round(float(amount_float) * 100))
 
 def major_units(cents: int) -> float:
@@ -2975,9 +2958,6 @@ def _save(obj):
     _payments_db.session.add(obj)
     _payments_db.session.commit()
 
-def _commit():
-    _payments_db.session.commit()
-
 def _update_payment_status(pay: Payment, status: str, **fields):
     pay.status = status
     pay.updated_at = _utcnow_str()
@@ -2991,7 +2971,7 @@ def _credit_wallet(ext_user_id: str, cents: int):
     _save(u)
 
 # -------------------------
-# INDEX / BILLING PAGE
+# BILLING HTML PAGE
 # -------------------------
 _BILLING_HTML = """
 <!doctype html>
@@ -3001,169 +2981,75 @@ _BILLING_HTML = """
   <title>{{app_name}} — Billing</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu; margin:0; padding:0; background:#0b1020; color:#e9ecf1;}
-    header{padding:24px; display:flex; justify-content:space-between; align-items:center; background:#0e1530; position:sticky; top:0; border-bottom:1px solid #1e2748;}
-    .brand{font-weight:700; letter-spacing:.3px;}
-    .wrap{max-width:980px; margin:24px auto; padding:0 16px;}
-    .card{background:#101735; border:1px solid #232c56; border-radius:16px; padding:18px; box-shadow:0 10px 30px rgba(0,0,0,.25);}
-    .row{display:grid; grid-template-columns:1fr 1fr; gap:18px;}
-    label{font-size:14px; opacity:.9;}
-    input,select{width:100%; padding:12px 14px; border-radius:12px; background:#0f1733; border:1px solid #2a376b; color:#f1f5ff; outline:none;}
-    button{padding:12px 16px; border:none; border-radius:12px; background:#4a7dff; color:white; font-weight:600; cursor:pointer;}
-    button:disabled{opacity:.5; cursor:not-allowed;}
-    .muted{opacity:.8; font-size:14px;}
-    .mt8{margin-top:8px}
-    .mt12{margin-top:12px}
-    .mt16{margin-top:16px}
-    .mt24{margin-top:24px}
-    .tag{display:inline-block; padding:4px 8px; border-radius:999px; background:#1a2249; border:1px solid #324079; font-size:12px; margin-right:6px;}
+    body{font-family:system-ui; background:#0b1020; color:#e9ecf1; margin:0; padding:0;}
+    header{padding:20px; background:#0e1530; border-bottom:1px solid #1e2748; display:flex; justify-content:space-between;}
+    .card{background:#101735; border:1px solid #232c56; border-radius:12px; padding:16px; margin-top:16px;}
+    input,select{width:100%; padding:10px; border-radius:10px; border:1px solid #2a376b; background:#0f1733; color:#fff;}
+    button{padding:12px; border:none; border-radius:10px; background:#4a7dff; color:white; font-weight:600;}
     table{width:100%; border-collapse:collapse; margin-top:12px;}
-    th,td{padding:10px 8px; border-bottom:1px dashed #2a3566; font-size:14px;}
-    .ok{color:#5dd39e}
-    .bad{color:#ff7171}
-    .pending{color:#ffd166}
-    .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace;}
+    th,td{padding:8px; border-bottom:1px dashed #2a3566; font-size:14px;}
+    .ok{color:#5dd39e}.bad{color:#ff7171}.pending{color:#ffd166}
   </style>
 </head>
 <body>
 <header>
-  <div class="brand">{{app_name}} · Billing</div>
-  <div class="muted">Currency: {{currency}}</div>
+  <div>{{app_name}} · Billing</div>
+  <div>Currency: {{currency}}</div>
 </header>
-<div class="wrap">
+<div style="max-width:800px; margin:auto; padding:16px;">
   <div class="card">
     <h2>Add Funds</h2>
-    <div class="row mt12">
-      <div>
-        <label>External User ID</label>
-        <input id="uid" placeholder="e.g. telegram_1234 or user@example.com" />
-        <div class="muted mt8">यह वही ID है जिसके Wallet में बैलेंस क्रेडिट होगा।</div>
-      </div>
-      <div>
-        <label>Amount ({{currency}})</label>
-        <input id="amt" type="number" min="1" value="99" />
-      </div>
-    </div>
-    <div class="row mt12">
-      <div>
-        <label>Gateway</label>
-        <select id="gw">
-          <option value="razorpay">Razorpay</option>
-          <option value="cashfree">Cashfree</option>
-          <option value="paypal">PayPal</option>
-        </select>
-      </div>
-      <div>
-        <label>Display Name (optional)</label>
-        <input id="name" placeholder="Ganesh" />
-      </div>
-    </div>
-    <div class="mt16">
-      <button id="paybtn">Create & Pay</button>
-      <span id="msg" class="muted" style="margin-left:12px;"></span>
-    </div>
+    <label>User ID</label>
+    <input id="uid" placeholder="telegram_123" />
+    <label>Amount ({{currency}})</label>
+    <input id="amt" type="number" min="1" value="99" />
+    <label>Gateway</label>
+    <select id="gw">
+      <option value="razorpay">Razorpay</option>
+      <option value="cashfree">Cashfree</option>
+      <option value="paypal">PayPal</option>
+    </select>
+    <label>Name</label>
+    <input id="name" placeholder="Your Name"/>
+    <button id="paybtn">Create & Pay</button>
+    <div id="msg"></div>
   </div>
 
-  <div class="card mt24">
-    <h3>Check Wallet</h3>
-    <div class="row">
-      <div>
-        <label>External User ID</label>
-        <input id="check_uid" placeholder="same as above" />
-      </div>
-      <div style="display:flex; align-items:flex-end;">
-        <button id="checkbtn">Check</button>
-        <div id="balinfo" class="muted" style="margin-left:12px;"></div>
-      </div>
-    </div>
+  <div class="card">
+    <h3>Wallet</h3>
+    <input id="check_uid" placeholder="Enter User ID"/>
+    <button id="checkbtn">Check</button>
+    <div id="balinfo"></div>
   </div>
 
-  <div class="card mt24">
-    <h3>Recent Payments (this session)</h3>
-    <div class="muted">खरीद के बाद status auto-update webhooks से होगा।</div>
-    <table id="tbl">
-      <thead>
-        <tr>
-          <th>ID</th>
-          <th>Gateway</th>
-          <th>Amount</th>
-          <th>Status</th>
-          <th>Provider Ref</th>
-        </tr>
-      </thead>
-      <tbody id="rows">
-      </tbody>
-    </table>
+  <div class="card">
+    <h3>Recent</h3>
+    <table><thead><tr><th>ID</th><th>Gateway</th><th>Amount</th><th>Status</th></tr></thead>
+    <tbody id="rows"></tbody></table>
   </div>
 </div>
-
 <script>
-const $ = (s)=>document.querySelector(s);
-const rows = $('#rows');
-const msg = $('#msg');
-const publicUrl = "{{public_url}}";
-
-function addRow(p){
-  const tr = document.createElement('tr');
-  const cls = p.status==='paid'?'ok':(p.status==='failed'?'bad':'pending');
-  tr.innerHTML = `
-    <td class="mono">${p.idem_key || '-'}</td>
-    <td>${p.provider}</td>
-    <td>${(p.amount_cents/100).toFixed(2)} {{currency}}</td>
-    <td class="${cls}">${p.status}</td>
-    <td class="mono">${p.provider_order_id || p.provider_payment_id || '-'}</td>
-  `;
+const $=s=>document.querySelector(s);
+const rows=$("#rows"), msg=$("#msg");
+$("#paybtn").onclick=async()=>{
+  msg.textContent="Creating...";
+  const r=await fetch("/api/payments/create",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({
+    ext_user_id:$("#uid").value,display_name:$("#name").value,amount:parseFloat($("#amt").value||0),gateway:$("#gw").value
+  })});
+  const d=await r.json();
+  if(!r.ok){msg.textContent=d.error;return;}
+  const tr=document.createElement("tr");
+  tr.innerHTML=`<td>${d.idem_key}</td><td>${d.provider}</td><td>${d.amount_cents/100}</td><td>${d.status}</td>`;
   rows.prepend(tr);
-}
-
-$('#paybtn').onclick = async ()=>{
-  msg.textContent = 'Creating order...';
-  const ext_user_id = $('#uid').value.trim();
-  const amount = parseFloat($('#amt').value || '0');
-  const gateway = $('#gw').value;
-  const name = $('#name').value.trim();
-  if(!ext_user_id || amount<=0){ msg.textContent = 'Enter user id & valid amount.'; return; }
-  try{
-    const r = await fetch('/api/payments/create',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({
-      ext_user_id, display_name:name, amount, gateway
-    })});
-    const data = await r.json();
-    if(!r.ok){ msg.textContent = data.error || 'Failed'; return; }
-    msg.textContent = 'Order created. Opening checkout...';
-
-    if(gateway==='razorpay'){
-      // If you have Razorpay Checkout JS on client, you can open widget here.
-      // For now, we simply direct user to Razorpay's hosted page not available by API;
-      // So we show a generic success instruction. In real UI you would include Razorpay Checkout script.
-      alert('Razorpay Order created. Complete payment using your frontend integration.\nOrder ID: '+data.provider_order_id);
-    }else if(gateway==='cashfree'){
-      // Cashfree has PG session and drop-in JS. Here we just show link/instruction.
-      alert('Cashfree order created. Use Cashfree drop-in on client to complete.\nOrder ID: '+data.provider_order_id);
-    }else if(gateway==='paypal'){
-      // For PayPal, you’d render smart buttons with createOrder/capture. We’re server-first; tell user to proceed.
-      alert('PayPal order created. Use PayPal Buttons on client with order_id: '+data.provider_order_id);
-    }
-    addRow(data);
-    msg.textContent = 'Waiting for webhook to mark paid...';
-  }catch(e){
-    msg.textContent = 'Error: '+e.message;
-  }
+  msg.textContent="Order created, wait webhook...";
 };
-
-$('#checkbtn').onclick = async ()=>{
-  const uid = $('#check_uid').value.trim();
-  if(!uid){ return; }
-  const r = await fetch('/api/wallet/'+encodeURIComponent(uid));
-  const d = await r.json();
-  if(r.ok){
-    $('#balinfo').textContent = 'Balance: '+(d.balance_cents/100).toFixed(2)+' {{currency}}';
-  }else{
-    $('#balinfo').textContent = d.error || 'Error';
-  }
+$("#checkbtn").onclick=async()=>{
+  const r=await fetch("/api/wallet/"+encodeURIComponent($("#check_uid").value));
+  const d=await r.json();
+  $("#balinfo").textContent=r.ok?"Balance: "+(d.balance_cents/100):d.error;
 };
 </script>
-</body>
-</html>
+</body></html>
 """
 
 @billing_bp.route("/billing", methods=["GET"])
@@ -3174,9 +3060,16 @@ def billing_home():
         currency=cfg("CURRENCY", "INR"),
         public_url=cfg("PUBLIC_URL", "")
     )
+    # -------------------------
+# PART-16B (APIs, Webhooks, Admin, Health)
+# Paste this directly after Part-16A block in your main.py
+# -------------------------
+
+import time
+from flask import url_for
 
 # -------------------------
-# Create Payment API
+# CREATE PAYMENT (server-side)
 # -------------------------
 @billing_bp.route("/api/payments/create", methods=["POST"])
 def api_create_payment():
@@ -3228,7 +3121,7 @@ def api_create_payment():
                 "amount": cents,
                 "currency": currency,
                 "receipt": f"rcpt_{idem_key}",
-                "payment_capture": 1,  # auto-capture
+                "payment_capture": 1,
                 "notes": {"ext_user_id": ext_user_id, "idem_key": idem_key}
             }
             r = requests.post("https://api.razorpay.com/v1/orders", auth=auth, json=payload, timeout=15)
@@ -3240,12 +3133,12 @@ def api_create_payment():
             _update_payment_status(pay, "pending", provider_order_id=provider_order_id, raw_payload=json.dumps(resp))
 
         elif gateway == "cashfree":
-            # Cashfree PG (order create)
             app_id = cfg("CASHFREE_APP_ID","")
             secret_key = cfg("CASHFREE_SECRET_KEY","")
             env = (cfg("CASHFREE_ENV","TEST") or "TEST").upper()
+            if not app_id or not secret_key:
+                return jsonify({"error":"cashfree credentials missing"}), 400
             base = "https://sandbox.cashfree.com/pg" if env=="TEST" else "https://api.cashfree.com/pg"
-
             headers = {
                 "x-client-id": app_id,
                 "x-client-secret": secret_key,
@@ -3254,7 +3147,7 @@ def api_create_payment():
             }
             payload = {
                 "order_id": f"ord_{idem_key}",
-                "order_amount": amount,
+                "order_amount": float(f"{amount:.2f}"),
                 "order_currency": currency,
                 "customer_details": {
                     "customer_id": ext_user_id,
@@ -3273,18 +3166,17 @@ def api_create_payment():
                 _update_payment_status(pay, "failed", raw_payload=r.text)
                 return jsonify({"error":"cashfree order failed", "detail": r.text}), 400
             resp = r.json()
-            provider_order_id = resp.get("order_id","")
+            # Cashfree may return order_id in response structure differently; try common keys
+            provider_order_id = resp.get("order_id") or resp.get("data",{}).get("order_id","") or f"ord_{idem_key}"
             _update_payment_status(pay, "pending", provider_order_id=provider_order_id, raw_payload=json.dumps(resp))
 
         elif gateway == "paypal":
-            # Create PayPal Order (Server-side)
             client_id = cfg("PAYPAL_CLIENT_ID","")
             client_secret = cfg("PAYPAL_CLIENT_SECRET","")
             env = (cfg("PAYPAL_ENV","SANDBOX") or "SANDBOX").upper()
             base = "https://api-m.sandbox.paypal.com" if env=="SANDBOX" else "https://api-m.paypal.com"
             if not client_id or not client_secret:
                 return jsonify({"error":"paypal credentials missing"}), 400
-            # 1) get access token
             tok = requests.post(
                 f"{base}/v1/oauth2/token",
                 data={"grant_type":"client_credentials"},
@@ -3295,7 +3187,6 @@ def api_create_payment():
                 _update_payment_status(pay, "failed", raw_payload=tok.text)
                 return jsonify({"error":"paypal token failed", "detail":tok.text}), 400
             access_token = tok.json().get("access_token","")
-            # 2) create order
             payload = {
                 "intent":"CAPTURE",
                 "purchase_units":[
@@ -3336,6 +3227,7 @@ def api_create_payment():
         "provider_payment_id": provider_payment_id
     })
 
+
 # -------------------------
 # WALLET CHECK
 # -------------------------
@@ -3349,6 +3241,7 @@ def api_wallet(ext_user_id):
         "display_name": u.display_name,
         "balance_cents": u.balance_cents
     })
+
 
 # -------------------------
 # ADMIN SIMPLE LIST
@@ -3391,6 +3284,7 @@ def billing_admin():
     html += "</tbody></table></div></body></html>"
     return html
 
+
 # -------------------------
 # RAZORPAY WEBHOOK
 # -------------------------
@@ -3407,6 +3301,7 @@ def razorpay_webhook():
     sig = request.headers.get("X-Razorpay-Signature","")
     body = request.get_data()
     if not sig or not _verify_razorpay_signature(body, secret, sig):
+        # If signature fails, return 400
         return "invalid signature", 400
 
     evt = request.json or {}
@@ -3419,10 +3314,19 @@ def razorpay_webhook():
     provider_order_id = payment_entity.get("order_id") or order_entity.get("id","")
 
     # Attempt to locate payment by provider_order_id
-    pay = Payment.query.filter_by(provider="razorpay", provider_order_id=provider_order_id).order_by(Payment.id.desc()).first()
+    pay = None
+    if provider_order_id:
+        pay = Payment.query.filter_by(provider="razorpay", provider_order_id=provider_order_id).order_by(Payment.id.desc()).first()
     if not pay:
-        # fallback: try by notes.idem_key
-        pay = Payment.query.filter_by(provider="razorpay").order_by(Payment.id.desc()).first()
+        # fallback: try by idem_key in notes (notes may be present in order entity)
+        notes = order_entity.get("notes") or payment_entity.get("notes") or {}
+        idem_key = notes.get("idem_key") or notes.get("idempotency") or ""
+        if idem_key:
+            pay = Payment.query.filter_by(idem_key=idem_key).order_by(Payment.id.desc()).first()
+    if not pay:
+        # As last resort, try any pending razorpay payment for same amount and user (best-effort)
+        cand = Payment.query.filter_by(provider="razorpay", status="pending").order_by(Payment.id.desc()).first()
+        pay = cand
 
     if not pay:
         return "payment not found", 200
@@ -3433,34 +3337,30 @@ def razorpay_webhook():
     pay.updated_at = _utcnow_str()
 
     status = payment_entity.get("status","")
+    # Razorpay status 'captured' means success
     if et.startswith("payment.") and status == "captured":
         pay.status = "paid"
         _payments_db.session.commit()
-        # credit wallet
         _credit_wallet(pay.ext_user_id, pay.amount_cents)
     elif et.startswith("payment.") and status in ("failed","authorized","refunded","void"):
-        # Mark failed except captured success. You can expand mapping.
         pay.status = "failed" if status=="failed" else status
         _payments_db.session.commit()
 
     return "ok", 200
 
+
 # -------------------------
 # CASHFREE WEBHOOK
 # -------------------------
-def _cashfree_base():
-    env = (cfg("CASHFREE_ENV","TEST") or "TEST").upper()
-    return "https://sandbox.cashfree.com/pg" if env=="TEST" else "https://api.cashfree.com/pg"
-
 @billing_bp.route("/webhook/cashfree", methods=["POST"])
 def cashfree_webhook():
-    # Cashfree sends JSON; signature header x-webhook-signature (HMAC-SHA256 Base64 of body using Secret)
     secret = cfg("CASHFREE_SECRET_KEY","")
     if not secret:
         return "missing secret", 400
 
     sig = request.headers.get("x-webhook-signature","")
     body = request.get_data()
+    # Cashfree HMAC-SHA256 Base64(body)
     mac = hmac.new(secret.encode("utf-8"), msg=body, digestmod=hashlib.sha256).digest()
     expect = base64.b64encode(mac).decode("utf-8")
     if not sig or not hmac.compare_digest(sig, expect):
@@ -3470,11 +3370,19 @@ def cashfree_webhook():
     data = evt.get("data") or {}
     order = data.get("order") or {}
     payment = data.get("payment") or {}
-    provider_order_id = order.get("order_id","")
-    provider_payment_id = payment.get("cf_payment_id","")
-    status = (payment.get("payment_status") or "").lower()  # SUCCESS / FAILED / PENDING
+    provider_order_id = order.get("order_id","") or evt.get("order_id","")
+    provider_payment_id = payment.get("cf_payment_id","") or evt.get("payment_id","")
+    status = (payment.get("payment_status") or evt.get("status") or "").lower()
 
-    pay = Payment.query.filter_by(provider="cashfree", provider_order_id=provider_order_id).order_by(Payment.id.desc()).first()
+    pay = None
+    if provider_order_id:
+        pay = Payment.query.filter_by(provider="cashfree", provider_order_id=provider_order_id).order_by(Payment.id.desc()).first()
+    if not pay:
+        # fallback by idem/reference
+        ref = (order.get("order_id") or "").replace("ord_","")
+        if ref:
+            pay = Payment.query.filter_by(idem_key=ref).order_by(Payment.id.desc()).first()
+
     if not pay:
         return "payment not found", 200
 
@@ -3483,11 +3391,11 @@ def cashfree_webhook():
     pay.raw_payload = json.dumps(evt)
     pay.updated_at = _utcnow_str()
 
-    if status == "success":
+    if status in ("success","completed","paid"):
         pay.status = "paid"
         _payments_db.session.commit()
         _credit_wallet(pay.ext_user_id, pay.amount_cents)
-    elif status == "failed":
+    elif status in ("failed","failure"):
         pay.status = "failed"
         _payments_db.session.commit()
     else:
@@ -3496,12 +3404,10 @@ def cashfree_webhook():
 
     return "ok", 200
 
+
 # -------------------------
 # PAYPAL WEBHOOK
 # -------------------------
-# NOTE: Proper PayPal webhooks require verifying the transmission using the
-# "VERIFY-TRANSMISSION-SIG" endpoint or "cert" method. Below is a pragmatic
-# approach using order lookup with server token.
 def _paypal_base_and_token():
     env = (cfg("PAYPAL_ENV","SANDBOX") or "SANDBOX").upper()
     base = "https://api-m.sandbox.paypal.com" if env=="SANDBOX" else "https://api-m.paypal.com"
@@ -3522,25 +3428,33 @@ def _paypal_base_and_token():
 @billing_bp.route("/webhook/paypal", methods=["POST"])
 def paypal_webhook():
     evt = request.json or {}
-    summary = evt.get("summary","")
     resource = evt.get("resource") or {}
+    # resource may contain order id or capture id
     order_id = resource.get("id") or resource.get("supplementary_data",{}).get("related_ids",{}).get("order_id","")
 
     base, token = _paypal_base_and_token()
     if not token:
         return "paypal auth fail", 400
 
-    # Verify order status by fetching
+    if not order_id:
+        # try extracting from event
+        order_id = evt.get("resource",{}).get("id","") or evt.get("resource",{}).get("parent_payment","")
+
+    if not order_id:
+        return "no order id", 200
+
     r = requests.get(f"{base}/v2/checkout/orders/{order_id}", headers={"Authorization": f"Bearer {token}"}, timeout=20)
     if r.status_code != 200:
+        # Could be a capture or other event; still log and return
         return "order fetch failed", 400
     order = r.json()
     status = order.get("status","")
     ref = order.get("purchase_units",[{}])[0].get("reference_id","")
 
-    pay = Payment.query.filter_by(provider="paypal", provider_order_id=order_id).order_by(Payment.id.desc()).first()
-    if not pay:
-        # fallback match by idem/ref
+    pay = None
+    if order_id:
+        pay = Payment.query.filter_by(provider="paypal", provider_order_id=order_id).order_by(Payment.id.desc()).first()
+    if not pay and ref:
         pay = Payment.query.filter_by(provider="paypal", idem_key=ref).order_by(Payment.id.desc()).first()
     if not pay:
         return "payment not found", 200
@@ -3548,11 +3462,11 @@ def paypal_webhook():
     pay.provider_payment_id = order_id
     pay.raw_payload = json.dumps(evt)
     pay.updated_at = _utcnow_str()
-    if status == "COMPLETED":
+    if status.upper() in ("COMPLETED","APPROVED","CAPTURED"):
         pay.status = "paid"
         _payments_db.session.commit()
         _credit_wallet(pay.ext_user_id, pay.amount_cents)
-    elif status in ("VOIDED","CANCELLED","FAILED"):
+    elif status.upper() in ("VOIDED","CANCELED","CANCELLED","FAILED"):
         pay.status = "failed"
         _payments_db.session.commit()
     else:
@@ -3560,21 +3474,22 @@ def paypal_webhook():
         _payments_db.session.commit()
 
     return "ok", 200
-# -------------------------------------------------------
+
+
+# -------------------------
 # OPTIONAL: MANUAL CAPTURE (PayPal)
-# -------------------------------------------------------
+# -------------------------
 @billing_bp.route("/api/paypal/capture/<order_id>", methods=["POST"])
 def paypal_capture(order_id):
     base, token = _paypal_base_and_token()
     if not token:
-        return jsonify({"error": "paypal auth fail"}), 400
+        return jsonify({"error":"paypal auth fail"}), 400
     r = requests.post(f"{base}/v2/checkout/orders/{order_id}/capture",
-                      headers={"Authorization": f"Bearer {token}"},
+                      headers={"Authorization": f"Bearer {token}", "Content-Type":"application/json"},
                       json={}, timeout=20)
-    if r.status_code not in (200, 201):
-        return jsonify({"error": "capture failed", "detail": r.text}), 400
+    if r.status_code not in (200,201):
+        return jsonify({"error":"capture failed","detail":r.text}), 400
     resp = r.json()
-    # mark local if needed
     pay = Payment.query.filter_by(provider="paypal", provider_order_id=order_id).order_by(Payment.id.desc()).first()
     if pay:
         pay.status = "paid"
@@ -3583,77 +3498,29 @@ def paypal_capture(order_id):
         _credit_wallet(pay.ext_user_id, pay.amount_cents)
     return jsonify(resp)
 
-from payments import create_stripe_payment, create_razorpay_order, create_paypal_order, create_cashfree_order
 
-@app.route("/create-payment/stripe", methods=["POST"])
-def stripe_payment():
-    data = request.json
-    amount = float(data["amount"])
-    secret = create_stripe_payment(amount)
-    return jsonify({"client_secret": secret})
-
-@app.route("/create-payment/razorpay", methods=["POST"])
-def razorpay_payment():
-    data = request.json
-    amount = float(data["amount"])
-    order = create_razorpay_order(amount)
-    return jsonify(order)
-
-@app.route("/create-payment/paypal", methods=["POST"])
-def paypal_payment():
-    data = request.json
-    amount = float(data["amount"])
-    order = create_paypal_order(amount)
-    return jsonify(order)
-
-@app.route("/create-payment/cashfree", methods=["POST"])
-async def cashfree_payment():
-    data = request.json
-    order = await create_cashfree_order(
-        order_id=data["order_id"],
-        amount=float(data["amount"]),
-        email=data["email"],
-        phone=data["phone"]
-    )
-    return jsonify(order)
-# -------------------------------------------------------
-# HEALTH CHECK
-# -------------------------------------------------------
+# -------------------------
+# HEALTH
+# -------------------------
 @billing_bp.route("/payments/health", methods=["GET"])
 def payments_health():
     return jsonify({"ok": True, "time": _utcnow_str()})
 
 
-# -------------------------------------------------------
-# APP ENTRY POINT
-# -------------------------------------------------------
-from flask import Flask, request
-from telegram.ext import Application, CommandHandler
-import os, requests
-
-app = Flask(__name__)
-TOKEN = os.getenv("BOT_TOKEN")
-application = Application.builder().token(TOKEN).build()
-
-# Basic /start command
-async def start(update, context):
-    await update.message.reply_text("🤖 Ganesh A.I. Webhook mode में चल रहा है!")
-
-application.add_handler(CommandHandler("start", start))
-
-# Telegram webhook endpoint
-@app.route(f"/{TOKEN}", methods=["POST"])
-def telegram_webhook():
-    update = request.get_json(force=True)
-    application.update_queue.put_nowait(update)
-    return "OK"
-
+# -------------------------
+# END OF PART-16B
+# -------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
-
-    # Render domain से webhook register
     base_url = os.getenv("RENDER_EXTERNAL_URL")
-    webhook_url = f"{base_url}/{TOKEN}"
-    requests.get(f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={webhook_url}")
+
+    logger.info(
+        {
+            "section": "system",
+            "msg": "Ganesh A.I. starting...",
+            "extra": {},
+            "time": datetime.now(timezone.utc).isoformat(),
+        }
+    )
 
     app.run(host="0.0.0.0", port=port)
