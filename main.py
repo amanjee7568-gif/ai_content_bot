@@ -3629,19 +3629,19 @@ def payments_health():
 # -------------------------------------------------------
 from flask import Flask, request
 from telegram.ext import Application, CommandHandler
-import os
+import os, requests
 
 app = Flask(__name__)
 TOKEN = os.getenv("BOT_TOKEN")
 application = Application.builder().token(TOKEN).build()
 
-# Basic handler
+# Basic /start command
 async def start(update, context):
-    await update.message.reply_text("🤖 Ganesh A.I. Bot Webhook से चल रहा है!")
+    await update.message.reply_text("🤖 Ganesh A.I. Webhook mode में चल रहा है!")
 
 application.add_handler(CommandHandler("start", start))
 
-# Flask route for Telegram webhook
+# Telegram webhook endpoint
 @app.route(f"/{TOKEN}", methods=["POST"])
 def telegram_webhook():
     update = request.get_json(force=True)
@@ -3651,10 +3651,9 @@ def telegram_webhook():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
 
-    # पहले webhook register कर
-    import requests
-    url = f"https://{os.getenv('RENDER_EXTERNAL_URL')}/{TOKEN}"
-    requests.get(f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={url}")
+    # Render domain से webhook register
+    base_url = os.getenv("RENDER_EXTERNAL_URL")
+    webhook_url = f"{base_url}/{TOKEN}"
+    requests.get(f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={webhook_url}")
 
-    # Flask run
     app.run(host="0.0.0.0", port=port)
