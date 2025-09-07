@@ -1,0 +1,44 @@
+services:
+  - type: web
+    name: ganesh-ai-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: APP_NAME
+        value: "Ganesh A.I."
+      - key: DEBUG
+        value: "False"
+      - key: ADMIN_USER
+        value: "Admin"
+      - key: ADMIN_PASS
+        value: "12345"
+      - key: ADMIN_ID
+        value: "6646320334"
+      - key: BUSINESS_EMAIL
+        value: "ru387653@gmail.com"
+      - key: BUSINESS_NAME
+        value: "Artificial intelligence bot pvt Ltd"
+      - key: SUPPORT_USERNAME
+        value: "@amanjee7568"
+      - key: UPI_ID
+        value: "9234906001@ptyes"
+      - key: VISIT_PAY_RATE
+        value: "0.01"
+      - key: CHAT_PAY_RATE
+        value: "0.05"
+      - key: REFERRAL_BONUS
+        value: "10.0"
+      - key: PREMIUM_MONTHLY
+        value: "99.0"
+      - key: PREMIUM_YEARLY
+        value: "999.0"
+      - key: ADMIN_SHARE
+        value: "0.7"
+      - key: USER_SHARE
+        value: "0.3"
+      - key: ENABLE_SEARCH
+        value: "1"
+      - key: SHOW_TOOLS
+        value: "1"
