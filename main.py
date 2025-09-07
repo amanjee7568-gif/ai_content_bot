@@ -141,7 +141,7 @@ def log(section: str, level: str, message: str, extra: Dict = None):
         "section": section,
         "msg": message,
         "extra": extra or {},
-        "time": datetime.utcnow().isoformat()
+        "time": datetime.now(datetime.timezone.utc).isoformat()
     }
     
     log_level = getattr(logging, level.upper(), logging.INFO)
@@ -2211,17 +2211,17 @@ def migrate_database():
         if missing_columns:
             log("database", "INFO", f"Adding missing columns: {missing_columns}")
             
-            # Add missing columns with ALTER TABLE
+            # Add missing columns with ALTER TABLE using session.execute
             for col in missing_columns:
                 try:
                     if col in ['total_earned']:
-                        db.engine.execute(text(f"ALTER TABLE users ADD COLUMN {col} FLOAT DEFAULT 0.0"))
+                        db.session.execute(text(f"ALTER TABLE users ADD COLUMN {col} FLOAT DEFAULT 0.0"))
                     elif col in ['visits_count', 'chats_count', 'referrals_count']:
-                        db.engine.execute(text(f"ALTER TABLE users ADD COLUMN {col} INTEGER DEFAULT 0"))
+                        db.session.execute(text(f"ALTER TABLE users ADD COLUMN {col} INTEGER DEFAULT 0"))
                     elif col in ['referral_code', 'referred_by']:
-                        db.engine.execute(text(f"ALTER TABLE users ADD COLUMN {col} VARCHAR(20)"))
+                        db.session.execute(text(f"ALTER TABLE users ADD COLUMN {col} VARCHAR(20)"))
                     elif col in ['premium_until', 'last_visit']:
-                        db.engine.execute(text(f"ALTER TABLE users ADD COLUMN {col} DATETIME"))
+                        db.session.execute(text(f"ALTER TABLE users ADD COLUMN {col} DATETIME"))
                     
                     log("database", "INFO", f"Added column: {col}")
                 except Exception as e:
