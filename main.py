@@ -3627,5 +3627,30 @@ def payments_health():
 # -------------------------------------------------------
 # APP ENTRY POINT
 # -------------------------------------------------------
+import threading
+from telegram.ext import Application, CommandHandler
+import os
+
+def run_bot():
+    TOKEN = os.getenv("BOT_TOKEN")
+    if not TOKEN:
+        print("❌ BOT_TOKEN missing, Telegram Bot नहीं चलेगा")
+        return
+
+    application = Application.builder().token(TOKEN).build()
+
+    async def start(update, context):
+        await update.message.reply_text("🤖 Ganesh A.I. Bot चालू है 24x7!")
+
+    application.add_handler(CommandHandler("start", start))
+
+    application.run_polling()
+
 if __name__ == "__main__":
+    # Start Telegram bot in background
+    bot_thread = threading.Thread(target=run_bot)
+    bot_thread.daemon = True
+    bot_thread.start()
+
+    # Start Flask app normally
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
