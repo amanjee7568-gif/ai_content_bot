@@ -1,0 +1,58 @@
+referral_code.html
+
+{% extends "base.html" %}
+{% block content %}
+<div class="container mt-4">
+  <h3>Your Referral Code</h3>
+  <p>Share this with your friends:</p>
+  <code>{{ code }}</code>
+</div>
+{% endblock %}
+
+
+---
+
+admin_commission.html
+
+{% extends "admin_base.html" %}
+{% block content %}
+<div class="container mt-4">
+  <h3>Commission Management</h3>
+  <p><strong>Admin Wallet Balance:</strong> ${{ wallet.balance }}</p>
+  <p><strong>Current Commission Rate:</strong> {{ current_rate * 100 }}%</p>
+
+  <form method="POST">
+    <div class="form-group">
+      <label>Set New Commission Rate (%)</label>
+      <input type="text" name="rate" class="form-control" placeholder="e.g. 0.15 for 15%">
+    </div>
+    <button class="btn btn-primary mt-2">Update Rate</button>
+  </form>
+
+  <hr>
+  <h4>Recent Commissions</h4>
+  <table class="table table-bordered">
+    <thead>
+      <tr>
+        <th>User</th>
+        <th>Amount</th>
+        <th>Rate</th>
+        <th>Date</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for c in commissions %}
+      <tr>
+        <td>{{ c.user_id }}</td>
+        <td>${{ c.amount }}</td>
+        <td>{{ c.commission_rate * 100 }}%</td>
+        <td>{{ c.created_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}
+
+
+---
