@@ -46,7 +46,8 @@ facebook-business==20.0.3  # Meta Ads API
 
 # ===== Payments =====
 stripe==11.3.0
-paypalrestsdk==1.14.0
+paypalhttp==1.0.1
+paypal-checkout-serversdk==1.0.3
 razorpay==1.4.2
 cashfree-sdk==1.0.3   # Cashfree unofficial wrapper
 
