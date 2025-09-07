@@ -49,7 +49,7 @@ stripe==11.3.0
 paypalhttp==1.0.1
 paypal-checkout-serversdk==1.0.3
 razorpay==1.4.2
-cashfree-sdk==1.0.3   # Cashfree unofficial wrapper
+cashfree-sdk==0.0.3   # Cashfree unofficial wrapper
 
 # ===== Extra =====
 typing-extensions==4.15.0
