@@ -1,0 +1,1 @@
+console.log("Ganesh A.I. frontend ready!");
