@@ -1,455 +1,361 @@
-# main.py
-# =============================================================================
-# Ganesh A.I. – Mega Expanded Single-File App
-# Web App + Admin Panel + Telegram Bot (Polling) + OpenAI + HF Proxy + SQLite
-# =============================================================================
-# Why "mega expanded"?
-# - Cleaned, production-ish structure but very well-commented so you can follow.
-# - Works with python-telegram-bot v21.* using Application.run_polling() in a
-#   background thread (no deprecated Updater.wait / start_polling awaits).
-# - Keeps UI features (search, prompt, results), Admin panel, Logs view, etc.
-# - Friendly error handling + health check + configuration via ENV only.
-#
-# =============================================================================
-
 import os
-import re
-import io
-import sys
 import json
-import uuid
 import time
-import queue
-import atexit
-import sqlite3 as sqlite
-import datetime as dt
+import csv
 import threading
+import asyncio
 import traceback
-from dataclasses import dataclass
-from typing import Optional, Dict, Any, Tuple, List
+from datetime import datetime, timedelta
+from functools import wraps
 
-from flask import (
-    Flask, request, jsonify, render_template_string,
-    session, redirect, url_for, abort
-)
+from flask import Flask, request, jsonify, session, redirect, url_for, render_template_string, make_response, abort
 
-from dotenv import load_dotenv
+# =============== Logging Helper ===============
+def log(level, msg):
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{ts} | {level:<5} | Ganesh A.I. | {msg}", flush=True)
 
-# OpenAI SDK v1.x
-from openai import OpenAI
+# =============== ENV & Flags ===============
+APP_NAME = os.getenv("APP_NAME", "Ganesh A.I.")
+PUBLIC_URL = os.getenv("PUBLIC_URL", "https://ai-content-bot.example.com")
+BRAND_URL = os.getenv("BRAND_URL", "https://brand.page/Ganeshagamingworld")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+HF_PROXY = os.getenv("HF_PROXY", "1").strip() in ("1", "true", "True")
+HF_API_URL = os.getenv("HF_API_URL", "http://127.0.0.1:3000")  # optional
+SECRET_KEY = os.getenv("SECRET_KEY", "change_this_secret")
+PORT = int(os.getenv("PORT", "10000"))
+HOST = "0.0.0.0"
 
-# Telegram (v21)
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    ContextTypes, filters
-)
+# Admin creds (as requested)
+ADMIN_USER = os.getenv("ADMIN_USER", "admin")
+ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
 
-# HTTP client (for optional HF proxy ping)
-import httpx
+# Telegram
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_POLLING = os.getenv("TELEGRAM_POLLING", "1").strip() in ("1", "true", "True")
 
-# =============================================================================
-# 0) ENV + CONFIG
-# =============================================================================
+# Faucet / Credits
+DAILY_FAUCET = int(os.getenv("DAILY_FAUCET", "25"))  # credits per day
+NEW_USER_CREDITS = int(os.getenv("NEW_USER_CREDITS", "50"))
 
-# Load .env if present (Render also injects env)
-load_dotenv()
+# =============== Flask App ===============
+app = Flask(__name__)
+app.secret_key = SECRET_KEY
 
-def env(key: str, default: Optional[str] = None) -> str:
-    v = os.getenv(key, default)
-    if v is None:
-        return ""
-    return v
+# =============== SQLite DB ===============
+import sqlite3
+DB_FILE = os.getenv("DB_FILE", "data.db")
 
-# ----- Required / Optional ENV Keys -----
-ENV = {
-    # Branding / URLs
-    "APP_NAME": env("APP_NAME", "Ganesh A.I."),
-    "PUBLIC_URL": env("PUBLIC_URL", "https://ai-content-bot.example.com"),
-    "BRAND_DOMAIN": env("BRAND_DOMAIN", "https://brand.page/Ganeshagamingworld"),
-
-    # Secrets
-    "SECRET_KEY": env("SECRET_KEY", "please-change-me"),
-    "ADMIN_USERNAME": env("ADMIN_USERNAME", "admin"),
-    "ADMIN_PASSWORD": env("ADMIN_PASSWORD", "admin123"),
-
-    # OpenAI
-    "OPENAI_API_KEY": env("OPENAI_API_KEY", ""),
-    "OPENAI_MODEL": env("OPENAI_MODEL", "gpt-4o-mini"),
-    "OPENAI_TIMEOUT": env("OPENAI_TIMEOUT", "60"),
-
-    # HuggingFace Proxy (as per your credentials)
-    "HUGGINGFACE_API_URL": env("HUGGINGFACE_API_URL", "https://candyai.com/artificialagents"),
-    "HUGGINGFACE_API_TOKEN": env("HUGGINGFACE_API_TOKEN", ""),
-
-    # Telegram
-    "TELEGRAM_BOT_TOKEN": env("TELEGRAM_BOT_TOKEN", ""),  # e.g. 8377....:AA...
-    "TELEGRAM_POLLING": env("TELEGRAM_POLLING", "true"),  # keep polling by default
-    "TELEGRAM_COMMAND_PREFIX": env("TELEGRAM_COMMAND_PREFIX", "/"),
-
-    # Database / Runtime
-    "SQLITE_PATH": env("SQLITE_PATH", "app.db"),
-    "LOG_LEVEL": env("LOG_LEVEL", "INFO"),
-    "PORT": env("PORT", "10000"),
-}
-
-# Derived config
-APP_NAME = ENV["APP_NAME"]
-PORT = int(ENV["PORT"])
-OPENAI_TIMEOUT = int(ENV["OPENAI_TIMEOUT"])
-USE_TELEGRAM = bool(ENV["TELEGRAM_BOT_TOKEN"])
-TELEGRAM_POLLING = ENV["TELEGRAM_POLLING"].lower() == "true"
-
-# =============================================================================
-# 1) LOGGING
-# =============================================================================
-
-LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
-
-def log(level: str, msg: str):
-    """Simple structured log with level/time/app-name."""
-    lvl = level.upper()
-    if LEVELS.get(lvl, 20) < LEVELS.get(ENV["LOG_LEVEL"].upper(), 20):
-        return
-    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{now} | {lvl:<5} | {APP_NAME} | {msg}", flush=True)
-
-# =============================================================================
-# 2) DATABASE
-# =============================================================================
-
-DB_PATH = ENV["SQLITE_PATH"]
-
-def db_connect():
-    # Note: SQLite default adapter deprecation in Python 3.12 warnings
-    # are harmless for typical usage; acceptable in this small app.
-    conn = sqlite.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite.Row
+def db():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
     return conn
 
-def db_init():
-    conn = db_connect()
-    with conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              telegram_id TEXT UNIQUE,
-              username TEXT,
-              created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS logs (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              source TEXT,          -- 'web' | 'admin' | 'telegram'
-              level TEXT,           -- 'INFO', 'ERROR'
-              message TEXT,
-              meta TEXT,            -- JSON
-              created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS contents (
-              id TEXT PRIMARY KEY,  -- uuid
-              user_source TEXT,     -- 'web' | 'admin' | 'telegram'
-              input_prompt TEXT,
-              output_text TEXT,
-              created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
+def init_db():
+    conn = db()
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE,
+        credits INTEGER DEFAULT 0,
+        telegram_chat_id TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS logs(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel TEXT,
+        level TEXT,
+        message TEXT,
+        extra JSON,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS settings(
+        key TEXT PRIMARY KEY,
+        value TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS chats(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user TEXT,
+        prompt TEXT,
+        response TEXT,
+        tokens_in INTEGER DEFAULT 0,
+        tokens_out INTEGER DEFAULT 0,
+        provider TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    conn.commit()
     conn.close()
 
-def db_log(source: str, level: str, message: str, meta: Optional[dict] = None):
+def db_log(channel, level, message, extra=None):
     try:
-        conn = db_connect()
-        with conn:
-            conn.execute(
-                "INSERT INTO logs (source, level, message, meta) VALUES (?, ?, ?, ?)",
-                (source, level, message, json.dumps(meta or {}))
-            )
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO logs(channel, level, message, extra) VALUES (?,?,?,?)",
+                    (channel, level, message, json.dumps(extra or {})))
+        conn.commit()
+        conn.close()
     except Exception as e:
         log("ERROR", f"db_log failed: {e}")
 
-def db_save_content(user_source: str, prompt: str, output: str) -> str:
-    _id = str(uuid.uuid4())
+init_db()
+
+# =============== OpenAI Client ===============
+USE_OPENAI = bool(OPENAI_API_KEY)
+if USE_OPENAI:
     try:
-        conn = db_connect()
-        with conn:
-            conn.execute(
-                "INSERT INTO contents (id, user_source, input_prompt, output_text) VALUES (?, ?, ?, ?)",
-                (_id, user_source, prompt, output)
-            )
-        return _id
-    except Exception as e:
-        log("ERROR", f"db_save_content failed: {e}")
-        return _id
-
-def db_recent_logs(limit: int = 100) -> List[sqlite.Row]:
-    try:
-        conn = db_connect()
-        cur = conn.execute("SELECT * FROM logs ORDER BY id DESC LIMIT ?", (limit,))
-        rows = cur.fetchall()
-        conn.close()
-        return rows
-    except Exception as e:
-        log("ERROR", f"db_recent_logs failed: {e}")
-        return []
-
-def db_recent_contents(limit: int = 50) -> List[sqlite.Row]:
-    try:
-        conn = db_connect()
-        cur = conn.execute("SELECT * FROM contents ORDER BY created_at DESC LIMIT ?", (limit,))
-        rows = cur.fetchall()
-        conn.close()
-        return rows
-    except Exception as e:
-        log("ERROR", f"db_recent_contents failed: {e}")
-        return []
-
-# Initialize DB
-db_init()
-
-# =============================================================================
-# 3) OPENAI + HF CLIENTS
-# =============================================================================
-
-OPENAI_AVAILABLE = bool(ENV["OPENAI_API_KEY"])
-HF_AVAILABLE = bool(ENV["HUGGINGFACE_API_URL"] and ENV["HUGGINGFACE_API_TOKEN"])
-
-client: Optional[OpenAI] = None
-if OPENAI_AVAILABLE:
-    try:
-        client = OpenAI(api_key=ENV["OPENAI_API_KEY"])
+        from openai import OpenAI
+        oai = OpenAI(api_key=OPENAI_API_KEY)
         log("INFO", "OpenAI client initialized.")
     except Exception as e:
         log("ERROR", f"OpenAI init failed: {e}")
+        USE_OPENAI = False
+else:
+    log("INFO", "OpenAI: OFF (no API key)")
 
-def call_openai(prompt: str, sys_prompt: Optional[str] = None) -> str:
-    """Text generation using Chat Completions (Responses API wrapper)."""
-    if not client:
-        raise RuntimeError("OpenAI client not configured")
+# =============== Simple Model Call Abstractions ===============
+def call_openai(prompt):
+    if not USE_OPENAI:
+        return "OpenAI key missing. Please set OPENAI_API_KEY."
     try:
-        msgs = []
-        if sys_prompt:
-            msgs.append({"role": "system", "content": sys_prompt})
-        msgs.append({"role": "user", "content": prompt})
-
-        resp = client.chat.completions.create(
-            model=ENV["OPENAI_MODEL"],
-            messages=msgs,
-            temperature=0.7,
-            max_tokens=800,
-            timeout=OPENAI_TIMEOUT,
+        # lightweight responses
+        r = oai.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "system", "content": "You are a helpful assistant."},
+                      {"role": "user", "content": prompt}],
+            temperature=0.6,
+            max_tokens=500
         )
-        out = (resp.choices[0].message.content or "").strip()
-        return out
+        return r.choices[0].message.content.strip()
     except Exception as e:
-        raise RuntimeError(f"OpenAI error: {e}")
+        db_log("openai", "ERROR", "openai call failed", {"err": str(e)})
+        return f"[OpenAI Error] {e}"
 
-def call_hf_proxy(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Optional call to your Hugging Face proxy endpoint (if you decide to use it)."""
-    if not HF_AVAILABLE:
-        raise RuntimeError("HF proxy not configured")
-    headers = {
-        "Authorization": f"Bearer {ENV['HUGGINGFACE_API_TOKEN']}",
-        "Content-Type": "application/json"
-    }
+def call_hf_proxy(prompt):
+    # Dummy fallback implementation; user’s infra can point HF_API_URL to a TGI server.
+    # Here we just echo if proxy is unreachable.
     try:
-        r = httpx.post(
-            ENV["HUGGINGFACE_API_URL"],
-            headers=headers,
-            json=payload,
-            timeout=60
-        )
-        r.raise_for_status()
-        return r.json()
+        import httpx
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.post(f"{HF_API_URL}/generate", json={"inputs": prompt})
+            if resp.status_code == 200:
+                data = resp.json()
+                # accept both TGI style and generic
+                if isinstance(data, dict) and "generated_text" in data:
+                    return data["generated_text"]
+                if isinstance(data, list) and data and "generated_text" in data[0]:
+                    return data[0]["generated_text"]
+                return str(data)
+            return f"[HF Proxy HTTP {resp.status_code}] {resp.text}"
     except Exception as e:
-        raise RuntimeError(f"HF proxy error: {e}")
+        db_log("hf", "ERROR", "hf proxy failed", {"err": str(e)})
+        return "[HF Proxy Error] (falling back) " + str(e)
 
-# =============================================================================
-# 4) PROMPT PRESETS
-# =============================================================================
+def generate_text(prompt, user="web"):
+    provider = "openai" if USE_OPENAI else ("hf-proxy" if HF_PROXY else "local-echo")
+    if provider == "openai":
+        out = call_openai(prompt)
+    elif provider == "hf-proxy":
+        out = call_hf_proxy(prompt)
+    else:
+        out = f"(echo) {prompt}"
 
-DEFAULT_SYS_PROMPT = (
-    "You are Ganesh A.I., a helpful content assistant that writes crisp, "
-    "SEO-friendly, original content. Keep answers structured with headings "
-    "and bullet points when useful."
-)
+    # save chat
+    try:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO chats(user, prompt, response, tokens_in, tokens_out, provider) VALUES (?,?,?,?,?,?)",
+                    (user, prompt, out, len(prompt.split()), len(out.split()), provider))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        db_log("db", "ERROR", "save chat failed", {"err": str(e)})
+    return out
 
-PRESETS = {
-    "yt_script": "Write a YouTube video script on: {topic}\nTone: engaging, fast-paced\nInclude: hook, key points, CTA.",
-    "yt_description": "Write a YouTube description for the video titled: {topic}\nInclude: summary, keywords, hashtags.",
-    "insta_captions": "Write 5 concise Instagram captions about: {topic}\nStyle: trendy + emoji.\nAdd 8-12 relevant hashtags.",
-    "blog_outline": "Create a detailed blog outline on: {topic}\nInclude H2/H3s and bullet points.",
-    "ad_copy": "Write 3 Facebook ad copies for: {topic}\nEach: 2-3 sentences, strong CTA.",
-}
+# =============== Credits Helpers ===============
+def get_or_create_user(username):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE username=?", (username,))
+    row = cur.fetchone()
+    if row:
+        conn.close()
+        return dict(row)
+    # create
+    cur.execute("INSERT INTO users(username, credits) VALUES (?,?)", (username, NEW_USER_CREDITS))
+    conn.commit()
+    cur.execute("SELECT * FROM users WHERE username=?", (username,))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row)
 
-# =============================================================================
-# 5) FLASK APP
-# =============================================================================
+def user_add_credits(username, delta):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET credits = COALESCE(credits,0)+? WHERE username=?", (delta, username))
+    conn.commit()
+    conn.close()
 
-app = Flask(__name__)
-app.secret_key = ENV["SECRET_KEY"]
+def user_has_credits(username, need=1):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT credits FROM users WHERE username=?", (username,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return False
+    return (row["credits"] or 0) >= need
 
-# --------------------- HTML Templates (Jinja in-code) ------------------------
+def user_consume_credit(username, cost=1):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET credits = credits - ? WHERE username=? AND credits >= ?",
+                (cost, username, cost))
+    ok = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return ok
 
-BASE_CSS = """
-:root{
-  --bg:#0b1020; --card:#121833; --text:#e9ecff; --muted:#b6b9d8; --acc:#7aa2ff;
-  --ok:#20c997; --warn:#ffb020; --err:#ff6b6b;
-  --bord: rgba(255,255,255,0.08);
-}
-*{box-sizing:border-box}
-body{margin:0;font:15px/1.5 ui-sans-serif,system-ui,Segoe UI,Roboto;color:var(--text);background:radial-gradient(80% 120% at 50% -10%,#182048 0%,#0b1020 60%) fixed}
-a{color:var(--acc);text-decoration:none}
-.container{max-width:1100px;margin:32px auto;padding:0 16px}
-.nav{display:flex;gap:18px;align-items:center;justify-content:space-between}
-.brand{display:flex;gap:10px;align-items:center}
-.brand .logo{width:36px;height:36px;border-radius:12px;background:linear-gradient(135deg,#7aa2ff, #53f3c3)}
-.card{background:var(--card);border:1px solid var(--bord);border-radius:18px;padding:18px;box-shadow:0 20px 60px rgba(0,0,0,.25)}
-.grid{display:grid;gap:18px}
-.grid-2{grid-template-columns:1.2fr .8fr}
-input,textarea,select,button{width:100%;padding:12px 14px;border-radius:12px;border:1px solid var(--bord);background:#0d1430;color:var(--text)}
-button{cursor:pointer;background:linear-gradient(135deg,#7aa2ff,#53f3c3);border:none;font-weight:600}
-button.secondary{background:#0d1430}
-.badge{font-size:12px;padding:4px 8px;border-radius:999px;border:1px solid var(--bord);color:var(--muted)}
-.small{color:var(--muted);font-size:13px}
-hr{border:none;border-top:1px solid var(--bord);margin:14px 0}
-.kv{display:grid;grid-template-columns:160px 1fr;gap:8px;align-items:center}
-.logline{border-left:3px solid var(--bord);padding-left:10px;margin:8px 0;color:#c7ccff}
-.logline.INFO{border-color:#3b82f6}
-.logline.ERROR{border-color:#ef4444}
-footer{margin:24px 0 12px;color:#9aa0c2;text-align:center}
-.code{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas; background:#0a0f24;border:1px solid var(--bord);border-radius:12px;padding:12px;white-space:pre-wrap}
-"""
+# =============== Scheduler (Daily Faucet) ===============
+def faucet_job():
+    try:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET credits = COALESCE(credits,0) + ?", (DAILY_FAUCET,))
+        conn.commit()
+        conn.close()
+        db_log("scheduler", "INFO", f"Daily faucet +{DAILY_FAUCET} credits added to all users", {})
+    except Exception as e:
+        db_log("scheduler", "ERROR", "faucet job failed", {"err": str(e)})
 
-INDEX_HTML = """
+def start_scheduler_thread():
+    def loop():
+        while True:
+            try:
+                faucet_job()
+            except Exception as e:
+                log("ERROR", f"Scheduler error: {e}")
+            time.sleep(24 * 3600)
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+
+# =============== HTML Templates (inline) ===============
+HOME_HTML = """
 <!doctype html>
-<html lang="en">
+<html>
 <head>
-  <meta charset="utf-8">
-  <title>{{ app_name }} — AI Content Studio</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>{{ css }}</style>
+  <meta charset="utf-8" />
+  <title>{{ app_name }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#0b1220;color:#e6edf3}
+    header{display:flex;justify-content:space-between;align-items:center;padding:16px 22px;border-bottom:1px solid #1e2a44;background:#0e1628}
+    .brand a{color:#9bc1ff;text-decoration:none;font-weight:600}
+    .container{max-width:860px;margin:24px auto;padding:0 16px}
+    .card{background:#101a33;border:1px solid #1e2a44;border-radius:14px;padding:14px 14px 12px 14px;margin-bottom:14px}
+    textarea{width:100%;min-height:110px;background:#0b1220;border:1px solid #21314f;border-radius:10px;padding:12px;color:#e6edf3;resize:vertical}
+    button{border:0;border-radius:10px;padding:10px 14px;font-weight:600;cursor:pointer}
+    .btn{background:#2f6feb;color:#fff}
+    .btn:disabled{opacity:.6;cursor:not-allowed}
+    .row{display:flex;gap:10px;flex-wrap:wrap}
+    .row>*{flex:1}
+    #out{white-space:pre-wrap;line-height:1.45}
+    .muted{color:#9aa8c1;font-size:13px}
+    .hist{max-height:260px;overflow:auto;border:1px solid #1e2a44;border-radius:10px;padding:8px}
+    .chip{display:inline-block;background:#0e1b34;border:1px solid #24426c;color:#b4cfff;border-radius:999px;padding:5px 10px;margin:4px 6px 0 0;font-size:12px;cursor:pointer}
+    .topline{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+    .badge{font-size:12px;background:#102040;border:1px solid #1f3a66;border-radius:999px;padding:4px 8px;color:#9bc1ff}
+  </style>
 </head>
 <body>
-  <div class="container">
-    <div class="nav">
-      <div class="brand">
-        <div class="logo"></div>
-        <div>
-          <div style="font-weight:700">{{ app_name }}</div>
-          <div class="small">Create scripts, captions & more.</div>
-        </div>
-      </div>
-      <div class="small">
-        <a href="{{ brand_domain }}" target="_blank">Brand Page</a> •
-        <a href="/admin">Admin</a>
-      </div>
+<header>
+  <div class="brand"><a href="{{ brand_url }}" target="_blank">{{ app_name }}</a></div>
+  <div><a class="badge" href="/admin">Admin</a></div>
+</header>
+<div class="container">
+  <div class="card">
+    <div class="topline">
+      <div><strong>Ask anything</strong></div>
+      <div class="badge">Model: {{ model }}</div>
+      <div class="badge">HF Proxy: {{ 'ON' if hf_proxy else 'OFF' }}</div>
     </div>
-
-    <div class="grid grid-2" style="margin-top:18px">
-      <div class="card">
-        <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
-          <div class="badge">Home</div>
-          <div class="small">Search + Generate</div>
-        </div>
-
-        <label>Search Topic</label>
-        <input id="search" placeholder="e.g. Budget gaming PC under ₹50k, GTA 6 news..." />
-
-        <div style="display:grid;grid-template-columns:1fr 200px; gap:12px; margin-top:10px">
-          <input id="prompt" placeholder="What do you want to generate?" value="Write a YouTube script on this topic." />
-          <select id="preset">
-            <option value="">-- Presets --</option>
-            <option value="yt_script">YouTube Script</option>
-            <option value="yt_description">YouTube Description</option>
-            <option value="insta_captions">Instagram Captions</option>
-            <option value="blog_outline">Blog Outline</option>
-            <option value="ad_copy">Ad Copy</option>
-          </select>
-        </div>
-
-        <div style="display:flex;gap:12px;margin-top:12px">
-          <button id="btnGen">Generate</button>
-          <button id="btnClear" class="secondary">Clear</button>
-        </div>
-
-        <hr>
-        <div id="result" class="card" style="background:#0a0f24"></div>
-      </div>
-
-      <div class="card">
-        <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
-          <div class="badge">Status</div>
-          <div class="small">Runtime & Config</div>
-        </div>
-
-        <div class="kv small">
-          <div>Model</div><div>{{ model }}</div>
-          <div>OpenAI</div><div>{{ 'ON' if openai_on else 'OFF' }}</div>
-          <div>HF Proxy</div><div>{{ 'ON' if hf_on else 'OFF' }}</div>
-          <div>Telegram</div><div>{{ 'ON' if telegram_on else 'OFF' }}</div>
-          <div>Public URL</div><div><a href="{{ public_url }}" target="_blank">{{ public_url }}</a></div>
-        </div>
-
-        <hr>
-        <div class="small">Recent Logs</div>
-        <div id="logs">
-          {% for row in logs %}
-            <div class="logline {{ row['level'] }}"><b>[{{ row['source'] }}]</b> {{ row['message'] }}</div>
-          {% endfor %}
-        </div>
-      </div>
+    <p class="muted">Type your prompt below and hit Generate. History stays for this page session only.</p>
+    <textarea id="in" placeholder="Write your prompt..."></textarea>
+    <div class="row" style="margin-top:8px">
+      <button id="go" class="btn">Generate</button>
+      <button id="clr">Clear</button>
     </div>
-
-    <footer>© {{ year }} {{ app_name }}</footer>
+    <div id="out" class="card" style="margin-top:12px"></div>
   </div>
 
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <strong>Quick History</strong>
+      <button id="clearHist">Clear History</button>
+    </div>
+    <div id="hist" class="hist"></div>
+  </div>
+</div>
+
 <script>
-const $ = (q)=>document.querySelector(q);
-const result = $("#result");
-const logs = $("#logs");
+  const $in = document.getElementById('in');
+  const $out = document.getElementById('out');
+  const $go = document.getElementById('go');
+  const $clr = document.getElementById('clr');
+  const $hist = document.getElementById('hist');
+  const $clearHist = document.getElementById('clearHist');
 
-$("#btnClear").onclick = () => {
-  $("#search").value = "";
-  $("#prompt").value = "";
-  result.innerHTML = "";
-};
+  let historyList = JSON.parse(localStorage.getItem('hist')||'[]');
 
-$("#preset").onchange = () => {
-  const v = $("#preset").value;
-  const topic = $("#search").value.trim() || "your topic";
-  const presets = {{ presets_json | safe }};
-  if (v && presets[v]) {
-    $("#prompt").value = presets[v].replace("{topic}", topic);
-  }
-};
-
-$("#btnGen").onclick = async () => {
-  const topic = $("#search").value.trim();
-  const prompt = $("#prompt").value.trim();
-  if (!topic && !prompt) {
-    alert("Enter a topic or a prompt.");
-    return;
-  }
-  result.innerHTML = "<div class='small'>Generating...</div>";
-
-  try {
-    const r = await fetch("/api/generate", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ topic, prompt })
+  function renderHist(){
+    $hist.innerHTML = '';
+    historyList.slice().reverse().forEach(h=>{
+      const div = document.createElement('span');
+      div.className='chip';
+      div.textContent = h.prompt.slice(0,80);
+      div.title = 'Click to reuse';
+      div.onclick = ()=>{$in.value = h.prompt;};
+      $hist.appendChild(div);
     });
-    const j = await r.json();
-    if (!r.ok) throw new Error(j.error || "Failed");
-    const out = j.output || "";
-    result.innerHTML = "<div class='code' style='white-space:pre-wrap'>" + out.replace(/</g,'&lt;') + "</div>";
-  } catch (e) {
-    result.innerHTML = "<div class='logline ERROR'>"+ e.message +"</div>";
   }
-};
+  renderHist();
+
+  $clearHist.onclick = ()=>{
+    historyList = [];
+    localStorage.setItem('hist', JSON.stringify(historyList));
+    renderHist();
+  };
+
+  $clr.onclick = ()=>{ $in.value=''; $out.textContent=''; };
+
+  $go.onclick = async ()=>{
+    const prompt = $in.value.trim();
+    if(!prompt){ alert('Enter prompt'); return; }
+    $go.disabled = true;
+    $out.textContent = 'Generating...';
+    try{
+      const r = await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt, user:'web'})});
+      const j = await r.json();
+      if(j.ok){
+        $out.textContent = j.data;
+        historyList.push({prompt, ts:Date.now()});
+        historyList = historyList.slice(-50);
+        localStorage.setItem('hist', JSON.stringify(historyList));
+        renderHist();
+      }else{
+        $out.textContent = 'Error: ' + (j.error||'unknown');
+      }
+    }catch(e){
+      $out.textContent = 'Network error: '+e;
+    }finally{
+      $go.disabled = false;
+    }
+  };
 </script>
 </body>
 </html>
@@ -457,515 +363,394 @@ $("#btnGen").onclick = async () => {
 
 ADMIN_LOGIN_HTML = """
 <!doctype html>
-<html><head><meta charset="utf-8"><title>Admin Login</title>
-<style>{{ css }}</style></head>
+<html><head><meta charset="utf-8"/><title>Admin Login</title>
+<style>
+ body{font-family:system-ui;margin:0;background:#0b1220;color:#e6edf3}
+ .wrap{max-width:420px;margin:8% auto;background:#101a33;border:1px solid #1e2a44;border-radius:14px;padding:18px}
+ input{width:100%;padding:10px;border-radius:10px;border:1px solid #2a3c61;background:#0b1220;color:#e6edf3;margin:6px 0}
+ button{width:100%;padding:10px;border:0;border-radius:10px;background:#2f6feb;color:#fff;font-weight:700}
+ .muted{color:#9aa8c1}
+ .err{color:#ff9aa2;margin:6px 0 0 0}
+</style></head>
 <body>
-<div class="container">
-  <div class="nav">
-    <div class="brand">
-      <div class="logo"></div>
-      <div>
-        <div style="font-weight:700">{{ app_name }}</div>
-        <div class="small">Admin Panel</div>
-      </div>
-    </div>
-    <div class="small"><a href="/">Home</a></div>
-  </div>
-
-  <div class="card" style="max-width:520px;margin:24px auto">
-    <div class="badge">Login</div><br>
-    {% if error %}<div class="logline ERROR">{{ error }}</div>{% endif %}
-    <form method="post">
-      <label>Username</label>
-      <input name="username" placeholder="admin">
-      <label>Password</label>
-      <input name="password" type="password" placeholder="••••••••">
-      <div style="display:flex;gap:10px;margin-top:12px">
-        <button type="submit">Sign in</button>
-        <a class="small" href="{{ brand_domain }}" target="_blank">Brand Page</a>
-      </div>
-    </form>
-  </div>
-  <footer>© {{ year }} {{ app_name }}</footer>
+<div class="wrap">
+  <h3>Admin Login</h3>
+  <form method="post">
+    <input name="username" placeholder="Username" autocomplete="username" />
+    <input name="password" type="password" placeholder="Password" autocomplete="current-password" />
+    <button>Login</button>
+    {% if err %}<div class="err">{{ err }}</div>{% endif %}
+    <p class="muted" style="margin-top:12px">Default: admin / admin123 (change in .env)</p>
+  </form>
 </div>
 </body></html>
 """
 
-ADMIN_HTML = """
+ADMIN_DASH_HTML = """
 <!doctype html>
-<html><head><meta charset="utf-8"><title>Admin — {{ app_name }}</title>
-<style>{{ css }}</style></head>
+<html><head><meta charset="utf-8"/><title>Admin</title>
+<style>
+ body{font-family:system-ui;margin:0;background:#0b1220;color:#e6edf3}
+ header{display:flex;justify-content:space-between;align-items:center;padding:16px 22px;border-bottom:1px solid #1e2a44;background:#0e1628}
+ .container{max-width:980px;margin:20px auto;padding:0 16px}
+ .card{background:#101a33;border:1px solid #1e2a44;border-radius:14px;padding:14px;margin:12px 0}
+ input,select{padding:8px;border-radius:8px;border:1px solid #22375e;background:#0b1220;color:#e6edf3}
+ button{padding:8px 12px;border-radius:8px;border:0;background:#2f6feb;color:#fff;cursor:pointer}
+ table{width:100%;border-collapse:collapse}
+ th,td{border-bottom:1px solid #1e2a44;padding:8px;text-align:left;font-size:14px}
+ .row{display:flex;gap:10px;flex-wrap:wrap}
+ .muted{color:#9aa8c1}
+ .badge{font-size:12px;background:#102040;border:1px solid #1f3a66;border-radius:999px;padding:4px 8px;color:#9bc1ff}
+ a{color:#9bc1ff}
+</style></head>
 <body>
+<header>
+  <div><strong>Admin</strong> <span class="badge">{{ app_name }}</span></div>
+  <div>
+    <a class="badge" href="/">Home</a>
+    <a class="badge" href="/admin/logout">Logout</a>
+  </div>
+</header>
 <div class="container">
-  <div class="nav">
-    <div class="brand">
-      <div class="logo"></div>
-      <div>
-        <div style="font-weight:700">{{ app_name }}</div>
-        <div class="small">Admin Panel</div>
-      </div>
+
+  <div class="card">
+    <h3>Quick Stats</h3>
+    <div class="row">
+      <div>Total users: <strong>{{ stats.total_users }}</strong></div>
+      <div>Total chats: <strong>{{ stats.total_chats }}</strong></div>
+      <div>OpenAI: <strong>{{ 'ON' if use_openai else 'OFF' }}</strong></div>
+      <div>HF Proxy: <strong>{{ 'ON' if hf_proxy else 'OFF' }}</strong></div>
+      <div>Model: <strong>{{ model }}</strong></div>
     </div>
-    <div class="small"><a href="/">Home</a> • <a href="/admin/logout">Logout</a></div>
   </div>
 
-  <div class="grid">
-    <div class="card">
-      <div class="badge">Quick Generate</div>
-      <div class="small">Create content directly from admin.</div>
-      <div style="display:grid;grid-template-columns:1fr 220px; gap:12px; margin-top:10px">
-        <input id="topic" placeholder="Topic e.g. PUBG montage script">
-        <select id="preset">
-          <option value="">-- Presets --</option>
-          {% for k in presets.keys() %}
-           <option value="{{ k }}">{{ k }}</option>
+  <div class="card">
+    <h3>Users</h3>
+    <form class="row" method="post" action="/admin/create_user">
+      <input name="username" placeholder="username" required />
+      <input name="credits" type="number" placeholder="credits" value="50" />
+      <button>Create</button>
+    </form>
+    <form class="row" style="margin-top:8px" method="post" action="/admin/add_credits">
+      <input name="username" placeholder="username" required />
+      <input name="delta" type="number" placeholder="+/- credits" value="10" />
+      <button>Adjust</button>
+    </form>
+    <div style="overflow:auto;max-height:320px;margin-top:10px">
+      <table>
+        <thead><tr><th>Username</th><th>Credits</th><th>Telegram</th><th>Created</th></tr></thead>
+        <tbody>
+          {% for u in users %}
+          <tr>
+            <td>{{ u['username'] }}</td>
+            <td>{{ u['credits'] }}</td>
+            <td>{{ u['telegram_chat_id'] or '' }}</td>
+            <td>{{ u['created_at'] }}</td>
+          </tr>
           {% endfor %}
-        </select>
-      </div>
-      <label style="margin-top:10px">Prompt</label>
-      <textarea id="prompt" rows="6" placeholder="Or write a custom instruction..."></textarea>
-      <div style="display:flex; gap:10px; margin-top:10px">
-        <button id="btnGen">Generate</button>
-        <button class="secondary" id="btnClear">Clear</button>
-      </div>
-      <hr>
-      <div id="out" class="code"></div>
-    </div>
-
-    <div class="card">
-      <div class="badge">System</div>
-      <div class="small">Status, Logs, Tools</div>
-      <div class="kv small">
-        <div>Model</div><div>{{ model }}</div>
-        <div>OpenAI</div><div>{{ 'ON' if openai_on else 'OFF' }}</div>
-        <div>HF Proxy</div><div>{{ 'ON' if hf_on else 'OFF' }}</div>
-        <div>Telegram</div><div>{{ 'ON' if telegram_on else 'OFF' }}</div>
-        <div>Public URL</div><div><a href="{{ public_url }}" target="_blank">{{ public_url }}</a></div>
-      </div>
-      <hr>
-      <div class="small">Actions</div>
-      <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px">
-        <button id="btnPing" class="secondary">Ping HF Proxy</button>
-        <button id="btnSendTG" class="secondary">Send Test Telegram</button>
-      </div>
-
-      <hr>
-      <div class="small">Recent Logs</div>
-      <div id="logs">{% for row in logs %}
-        <div class="logline {{ row['level'] }}"><b>[{{ row['source'] }}]</b> {{ row['message'] }}</div>
-      {% endfor %}</div>
-    </div>
-
-    <div class="card">
-      <div class="badge">Recent Contents</div>
-      <div class="small">Last 20 items</div>
-      <div id="contents">
-        {% for c in contents %}
-          <div class="logline INFO"><b>{{ c['user_source'] }}</b> — {{ c['input_prompt'][:100] }}...
-          <div class="small" style="opacity:.8;margin-top:6px">{{ c['output_text'][:200] }}...</div></div>
-        {% endfor %}
-      </div>
+        </tbody>
+      </table>
     </div>
   </div>
 
-  <footer>© {{ year }} {{ app_name }}</footer>
+  <div class="card">
+    <h3>Recent Logs</h3>
+    <div style="overflow:auto;max-height:260px">
+      <table>
+        <thead><tr><th>When</th><th>Chan</th><th>Level</th><th>Message</th></tr></thead>
+        <tbody>
+          {% for l in logs %}
+          <tr>
+            <td>{{ l['created_at'] }}</td>
+            <td>{{ l['channel'] }}</td>
+            <td>{{ l['level'] }}</td>
+            <td>{{ l['message'] }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <a class="badge" href="/admin/export_logs">Export CSV</a>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Settings</h3>
+    <form class="row" method="post" action="/admin/save_settings">
+      <input name="key" placeholder="key (e.g. announcement)" />
+      <input name="value" placeholder="value" />
+      <button>Save</button>
+    </form>
+    <p class="muted">Stored in SQLite settings table.</p>
+  </div>
+
 </div>
-
-<script>
-const $ = (q)=>document.querySelector(q);
-const out = $("#out");
-
-$("#btnClear").onclick = () => { $("#topic").value=""; $("#prompt").value=""; out.textContent=""; };
-$("#preset").onchange = () => {
-  const v = $("#preset").value;
-  const topic = $("#topic").value.trim() || "your topic";
-  const presets = {{ presets_json | safe }};
-  if (v && presets[v]) $("#prompt").value = presets[v].replace("{topic}", topic);
-};
-
-$("#btnGen").onclick = async () => {
-  const topic = $("#topic").value.trim();
-  const prompt = $("#prompt").value.trim();
-  if (!topic && !prompt) { alert("Enter topic or prompt"); return; }
-  out.textContent = "Generating...";
-  const r = await fetch("/api/admin/generate", {
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({topic, prompt})
-  });
-  const j = await r.json();
-  if (!r.ok) { out.textContent = "Error: "+(j.error||"Failed"); return; }
-  out.textContent = j.output || "";
-};
-
-$("#btnPing").onclick = async () => {
-  const r = await fetch("/api/admin/ping-hf", {method:"POST"});
-  const j = await r.json();
-  alert(j.ok ? "HF OK: "+j.detail : "HF Error: "+j.error);
-};
-
-$("#btnSendTG").onclick = async () => {
-  const text = prompt("Enter test message for Telegram:");
-  if (!text) return;
-  const r = await fetch("/api/admin/send-telegram", {
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({ text })
-  });
-  const j = await r.json();
-  alert(j.ok ? "Sent!" : "Error: "+j.error);
-};
-</script>
 </body></html>
 """
 
-# --------------------- Helpers ---------------------
+# =============== Auth Decorator ===============
+def admin_required(f):
+    @wraps(f)
+    def w(*a, **k):
+        if not session.get("admin_ok"):
+            return redirect(url_for("admin_login"))
+        return f(*a, **k)
+    return w
 
-def is_admin() -> bool:
-    return session.get("admin_logged", False) is True
-
-def require_admin():
-    if not is_admin():
-        abort(403, description="Admin only")
-
-# --------------------- Routes ----------------------
-
-@app.get("/")
-def index():
-    logs = db_recent_logs(20)
+# =============== Routes: Public ===============
+@app.route("/")
+def home():
     return render_template_string(
-        INDEX_HTML,
-        css=BASE_CSS,
+        HOME_HTML,
         app_name=APP_NAME,
-        brand_domain=ENV["BRAND_DOMAIN"],
-        public_url=ENV["PUBLIC_URL"],
-        model=ENV["OPENAI_MODEL"],
-        openai_on=OPENAI_AVAILABLE,
-        hf_on=HF_AVAILABLE,
-        telegram_on=USE_TELEGRAM,
-        year=dt.datetime.now(dt.UTC).year if hasattr(dt, "UTC") else dt.datetime.utcnow().year,
-        logs=logs,
-        presets_json=json.dumps(PRESETS),
+        brand_url=BRAND_URL,
+        model=OPENAI_MODEL,
+        hf_proxy=HF_PROXY
     )
 
-@app.get("/healthz")
-def healthz():
-    status = {
-        "app": APP_NAME,
-        "time": dt.datetime.now().isoformat(),
-        "openai": OPENAI_AVAILABLE,
-        "hf_proxy": HF_AVAILABLE,
-        "telegram": USE_TELEGRAM,
-        "db": True
-    }
-    return jsonify(status)
+@app.route("/api/health")
+def api_health():
+    return jsonify(ok=True, app=APP_NAME, openai=USE_OPENAI, hf_proxy=HF_PROXY, model=OPENAI_MODEL)
 
-# ----- Auth -----
+@app.route("/api/generate", methods=["POST"])
+def api_generate():
+    try:
+        data = request.get_json(force=True)
+        prompt = (data.get("prompt") or "").strip()
+        username = (data.get("user") or "web").strip()
+        if not prompt:
+            return jsonify(ok=False, error="empty prompt"), 400
 
-@app.get("/admin/login")
-def admin_login_get():
-    if is_admin():
-        return redirect(url_for("admin_home"))
-    return render_template_string(
-        ADMIN_LOGIN_HTML,
-        css=BASE_CSS, app_name=APP_NAME, brand_domain=ENV["BRAND_DOMAIN"],
-        year=dt.datetime.now(dt.UTC).year if hasattr(dt, "UTC") else dt.datetime.utcnow().year,
-        error=None
-    )
+        u = get_or_create_user(username)
+        if not user_has_credits(username, 1):
+            return jsonify(ok=False, error="No credits. Try later."), 402
 
-@app.post("/admin/login")
-def admin_login_post():
-    u = request.form.get("username","").strip()
-    p = request.form.get("password","")
-    if u == ENV["ADMIN_USERNAME"] and p == ENV["ADMIN_PASSWORD"]:
-        session["admin_logged"] = True
-        db_log("web", "INFO", "Admin logged in", {"user": u})
-        return redirect(url_for("admin_home"))
-    db_log("web", "WARN", "Admin login failed", {"user": u})
-    return render_template_string(
-        ADMIN_LOGIN_HTML,
-        css=BASE_CSS, app_name=APP_NAME, brand_domain=ENV["BRAND_DOMAIN"],
-        year=dt.datetime.now(dt.UTC).year if hasattr(dt, "UTC") else dt.datetime.utcnow().year,
-        error="Invalid credentials"
-    )
+        ok = user_consume_credit(username, 1)
+        if not ok:
+            return jsonify(ok=False, error="Credit debit failed"), 500
 
-@app.get("/admin/logout")
+        out = generate_text(prompt, user=username)
+        return jsonify(ok=True, data=out)
+    except Exception as e:
+        db_log("api", "ERROR", "generate failed", {"err": str(e), "trace": traceback.format_exc()})
+        return jsonify(ok=False, error=str(e)), 500
+
+# =============== Routes: Admin ===============
+@app.route("/admin")
+def admin_root():
+    if not session.get("admin_ok"):
+        return redirect(url_for("admin_login"))
+    return redirect(url_for("admin_dashboard"))
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    err = None
+    if request.method == "POST":
+        u = request.form.get("username", "")
+        p = request.form.get("password", "")
+        # **IMPORTANT**: EXACT match with ENV (user report: "incorrect")
+        if u == ADMIN_USER and p == ADMIN_PASS:
+            session["admin_ok"] = True
+            db_log("admin", "INFO", "login success", {"user": u})
+            return redirect(url_for("admin_dashboard"))
+        err = "Incorrect username or password"
+        db_log("admin", "WARN", "login failed", {"user": u})
+    return render_template_string(ADMIN_LOGIN_HTML, err=err)
+
+@app.route("/admin/logout")
 def admin_logout():
     session.clear()
-    return redirect(url_for("admin_login_get"))
+    return redirect(url_for("admin_login"))
 
-@app.get("/admin")
-def admin_home():
-    if not is_admin():
-        return redirect(url_for("admin_login_get"))
-    logs = db_recent_logs(40)
-    contents = db_recent_contents(20)
-    return render_template_string(
-        ADMIN_HTML,
-        css=BASE_CSS,
-        app_name=APP_NAME,
-        public_url=ENV["PUBLIC_URL"],
-        model=ENV["OPENAI_MODEL"],
-        openai_on=OPENAI_AVAILABLE,
-        hf_on=HF_AVAILABLE,
-        telegram_on=USE_TELEGRAM,
-        year=dt.datetime.now(dt.UTC).year if hasattr(dt, "UTC") else dt.datetime.utcnow().year,
-        logs=logs,
-        contents=contents,
-        presets=PRESETS,
-        presets_json=json.dumps(PRESETS),
-    )
+@app.route("/admin/dashboard")
+@admin_required
+def admin_dashboard():
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(1) AS n FROM users")
+    total_users = cur.fetchone()["n"]
+    cur.execute("SELECT COUNT(1) AS n FROM chats")
+    total_chats = cur.fetchone()["n"]
+    cur.execute("SELECT username, credits, telegram_chat_id, created_at FROM users ORDER BY id DESC LIMIT 100")
+    users = [dict(r) for r in cur.fetchall()]
+    cur.execute("SELECT created_at, channel, level, message FROM logs ORDER BY id DESC LIMIT 100")
+    logs = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return render_template_string(ADMIN_DASH_HTML,
+                                  app_name=APP_NAME,
+                                  stats={"total_users": total_users, "total_chats": total_chats},
+                                  users=users, logs=logs,
+                                  use_openai=USE_OPENAI, hf_proxy=HF_PROXY, model=OPENAI_MODEL)
 
-# ----- APIs -----
-
-@app.post("/api/generate")
-def api_generate():
-    data = request.get_json(force=True, silent=True) or {}
-    topic = (data.get("topic") or "").strip()
-    prompt = (data.get("prompt") or "").strip()
-
-    if not (topic or prompt):
-        return jsonify({"error":"topic or prompt required"}), 400
-
-    # Expand preset if user has typed only topic with default prompt
-    final_prompt = prompt or PRESETS["yt_script"].replace("{topic}", topic)
+@app.route("/admin/create_user", methods=["POST"])
+@admin_required
+def admin_create_user():
+    username = request.form.get("username","").strip()
+    credits = int(request.form.get("credits","0") or "0")
+    if not username:
+        return redirect(url_for("admin_dashboard"))
     try:
-        output = call_openai(final_prompt, DEFAULT_SYS_PROMPT) if OPENAI_AVAILABLE else f"(OpenAI OFF)\n{final_prompt}"
-        db_log("web", "INFO", "Generated content", {"len": len(output)})
-        _id = db_save_content("web", final_prompt, output)
-        return jsonify({"ok":True, "id":_id, "output":output})
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO users(username, credits) VALUES (?,?)", (username, credits))
+        conn.commit()
+        conn.close()
+        db_log("admin", "INFO", "user created", {"u": username, "c": credits})
     except Exception as e:
-        db_log("web", "ERROR", "Generate failed", {"err": str(e)})
-        return jsonify({"error": str(e)}), 500
+        db_log("admin", "ERROR", "create_user failed", {"err": str(e)})
+    return redirect(url_for("admin_dashboard"))
 
-@app.post("/api/admin/generate")
-def api_admin_generate():
-    if not is_admin():
-        return jsonify({"error": "forbidden"}), 403
-    data = request.get_json(force=True, silent=True) or {}
-    topic = (data.get("topic") or "").strip()
-    prompt = (data.get("prompt") or "").strip()
-    if not (topic or prompt):
-        return jsonify({"error":"topic or prompt required"}), 400
-    final_prompt = prompt or PRESETS["yt_script"].replace("{topic}", topic)
-    try:
-        output = call_openai(final_prompt, DEFAULT_SYS_PROMPT) if OPENAI_AVAILABLE else f"(OpenAI OFF)\n{final_prompt}"
-        db_log("admin", "INFO", "Admin generated", {"len": len(output)})
-        _id = db_save_content("admin", final_prompt, output)
-        return jsonify({"ok":True, "id":_id, "output":output})
-    except Exception as e:
-        db_log("admin", "ERROR", "Admin generate failed", {"err": str(e)})
-        return jsonify({"error": str(e)}), 500
-
-@app.post("/api/admin/ping-hf")
-def api_admin_ping_hf():
-    if not is_admin():
-        return jsonify({"error": "forbidden"}), 403
-    if not HF_AVAILABLE:
-        return jsonify({"ok": False, "error": "HF proxy not configured"})
-    try:
-        resp = call_hf_proxy({"ping":"ok"})
-        return jsonify({"ok": True, "detail": str(resp)[:200]})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
-
-@app.post("/api/admin/send-telegram")
-def api_admin_send_telegram():
-    if not is_admin():
-        return jsonify({"error":"forbidden"}), 403
-    if not USE_TELEGRAM:
-        return jsonify({"error":"telegram not configured"}), 400
-    data = request.get_json(force=True, silent=True) or {}
-    text = (data.get("text") or "").strip() or "Test message from Admin Panel."
-    # We can't send to a user unless we know chat_id.
-    # So we store last_chat_id from recent telegram activity (see handler).
-    cid = tg_last_chat_id()
-    if not cid:
-        return jsonify({"error": "No chat_id yet. Send a message to bot first."}), 400
-    try:
-        tg_send_message(cid, f"🔔 Admin test: {text}")
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# =============================================================================
-# 6) TELEGRAM BOT (Polling Thread, PTB v21)
-# =============================================================================
-
-_TELEGRAM_APPLICATION: Optional[Application] = None
-_TELEGRAM_THREAD: Optional[threading.Thread] = None
-_LAST_CHAT_ID_PATH = ".last_chat_id"
-
-def tg_store_chat_id(chat_id: int):
-    try:
-        with open(_LAST_CHAT_ID_PATH, "w", encoding="utf-8") as f:
-            f.write(str(chat_id))
-    except Exception as e:
-        log("ERROR", f"store chat id failed: {e}")
-
-def tg_last_chat_id() -> Optional[int]:
-    try:
-        if not os.path.exists(_LAST_CHAT_ID_PATH):
-            return None
-        with open(_LAST_CHAT_ID_PATH, "r", encoding="utf-8") as f:
-            s = f.read().strip()
-            return int(s) if s else None
-    except Exception:
-        return None
-
-def tg_send_message(chat_id: int, text: str):
-    """Thread-safe helper using application.bot directly."""
-    if not _TELEGRAM_APPLICATION:
-        raise RuntimeError("Telegram app not ready")
-    bot = _TELEGRAM_APPLICATION.bot
-    return bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
-
-async def tg_cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id if update.effective_chat else None
-    if cid: tg_store_chat_id(cid)
-    user = update.effective_user
-    db_log("telegram", "INFO", "Start cmd", {"user": user.username if user else None})
-    msg = (
-        f"👋 Welcome to <b>{APP_NAME}</b>!\n"
-        f"Send me a topic or use commands:\n"
-        f"<code>{ENV['TELEGRAM_COMMAND_PREFIX']}script</code> – YouTube script\n"
-        f"<code>{ENV['TELEGRAM_COMMAND_PREFIX']}desc</code> – YouTube description\n"
-        f"<code>{ENV['TELEGRAM_COMMAND_PREFIX']}insta</code> – Instagram captions\n"
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
-
-async def tg_cmd_script(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id if update.effective_chat else None
-    if cid: tg_store_chat_id(cid)
-    text = " ".join(context.args) if context.args else (update.message.text or "")
-    topic = text.replace("/script","").strip()
-    if not topic:
-        await update.message.reply_text("Send: /script your topic")
-        return
-    prompt = PRESETS["yt_script"].replace("{topic}", topic)
-    try:
-        out = call_openai(prompt, DEFAULT_SYS_PROMPT) if OPENAI_AVAILABLE else f"(OpenAI OFF)\n{prompt}"
-        db_save_content("telegram", prompt, out)
-        await update.message.reply_text(out[:4096])
-    except Exception as e:
-        db_log("telegram", "ERROR", "script failed", {"err": str(e)})
-        await update.message.reply_text(f"Error: {e}")
-
-async def tg_cmd_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id if update.effective_chat else None
-    if cid: tg_store_chat_id(cid)
-    topic = " ".join(context.args) if context.args else (update.message.text or "")
-    topic = topic.replace("/desc","").strip()
-    if not topic:
-        await update.message.reply_text("Send: /desc video title/topic")
-        return
-    prompt = PRESETS["yt_description"].replace("{topic}", topic)
-    try:
-        out = call_openai(prompt, DEFAULT_SYS_PROMPT) if OPENAI_AVAILABLE else f"(OpenAI OFF)\n{prompt}"
-        db_save_content("telegram", prompt, out)
-        await update.message.reply_text(out[:4096])
-    except Exception as e:
-        db_log("telegram", "ERROR", "desc failed", {"err": str(e)})
-        await update.message.reply_text(f"Error: {e}")
-
-async def tg_cmd_insta(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id if update.effective_chat else None
-    if cid: tg_store_chat_id(cid)
-    topic = " ".join(context.args) if context.args else (update.message.text or "")
-    topic = topic.replace("/insta","").strip()
-    if not topic:
-        await update.message.reply_text("Send: /insta topic")
-        return
-    prompt = PRESETS["insta_captions"].replace("{topic}", topic)
-    try:
-        out = call_openai(prompt, DEFAULT_SYS_PROMPT) if OPENAI_AVAILABLE else f"(OpenAI OFF)\n{prompt}"
-        db_save_content("telegram", prompt, out)
-        await update.message.reply_text(out[:4096])
-    except Exception as e:
-        db_log("telegram", "ERROR", "insta failed", {"err": str(e)})
-        await update.message.reply_text(f"Error: {e}")
-
-async def tg_echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fallback: when user just sends a topic, we generate a script."""
-    cid = update.effective_chat.id if update.effective_chat else None
-    if cid: tg_store_chat_id(cid)
-    text = (update.message.text or "").strip()
-    if not text:
-        return
-    prompt = PRESETS["yt_script"].replace("{topic}", text)
-    try:
-        out = call_openai(prompt, DEFAULT_SYS_PROMPT) if OPENAI_AVAILABLE else f"(OpenAI OFF)\n{prompt}"
-        db_save_content("telegram", prompt, out)
-        await update.message.reply_text(out[:4096])
-    except Exception as e:
-        db_log("telegram", "ERROR", "echo failed", {"err": str(e)})
-        await update.message.reply_text(f"Error: {e}")
-
-def start_telegram_polling_in_thread():
-    global _TELEGRAM_APPLICATION, _TELEGRAM_THREAD
-    if not USE_TELEGRAM or not TELEGRAM_POLLING:
-        log("INFO", "Telegram polling disabled or token missing.")
-        return
-
-    # Build application
-    _TELEGRAM_APPLICATION = Application.builder().token(ENV["TELEGRAM_BOT_TOKEN"]).build()
-
-    # Handlers
-    _TELEGRAM_APPLICATION.add_handler(CommandHandler("start", tg_cmd_start))
-    _TELEGRAM_APPLICATION.add_handler(CommandHandler("script", tg_cmd_script))
-    _TELEGRAM_APPLICATION.add_handler(CommandHandler("desc", tg_cmd_desc))
-    _TELEGRAM_APPLICATION.add_handler(CommandHandler("insta", tg_cmd_insta))
-    _TELEGRAM_APPLICATION.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), tg_echo))
-
-    def _runner():
+@app.route("/admin/add_credits", methods=["POST"])
+@admin_required
+def admin_add_credits():
+    username = request.form.get("username","").strip()
+    delta = int(request.form.get("delta","0") or "0")
+    if username and delta:
         try:
-            db_log("telegram", "INFO", "Polling thread starting", {})
-            # Blocking call (sync), correct for v21
-            _TELEGRAM_APPLICATION.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                close_loop=False,  # we're in our own thread
-                stop_signals=None
-            )
-            db_log("telegram", "INFO", "Polling stopped", {})
+            user_add_credits(username, delta)
+            db_log("admin", "INFO", "credits adjusted", {"u": username, "delta": delta})
         except Exception as e:
-            db_log("telegram", "ERROR", f"polling crashed: {e}", {"trace": traceback.format_exc()})
+            db_log("admin", "ERROR", "add_credits failed", {"err": str(e)})
+    return redirect(url_for("admin_dashboard"))
 
-    _TELEGRAM_THREAD = threading.Thread(target=_runner, name="telegram-polling", daemon=True)
-    _TELEGRAM_THREAD.start()
-    log("INFO", "Telegram handlers registered. Mode: POLLING")
-
-def stop_telegram():
-    global _TELEGRAM_APPLICATION
+@app.route("/admin/save_settings", methods=["POST"])
+@admin_required
+def admin_save_settings():
+    k = (request.form.get("key") or "").strip()
+    v = (request.form.get("value") or "").strip()
+    if not k:
+        return redirect(url_for("admin_dashboard"))
     try:
-        if _TELEGRAM_APPLICATION:
-            _TELEGRAM_APPLICATION.stop()
-            db_log("telegram", "INFO", "Application.stop() invoked", {})
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, v))
+        conn.commit()
+        conn.close()
+        db_log("admin", "INFO", "setting saved", {"k": k})
     except Exception as e:
-        log("ERROR", f"Telegram stop error: {e}")
+        db_log("admin", "ERROR", "save_settings failed", {"err": str(e)})
+    return redirect(url_for("admin_dashboard"))
 
-atexit.register(stop_telegram)
+@app.route("/admin/export_logs")
+@admin_required
+def admin_export_logs():
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT created_at, channel, level, message, extra FROM logs ORDER BY id DESC LIMIT 5000")
+    rows = cur.fetchall()
+    conn.close()
 
-# =============================================================================
-# 7) APP STARTUP
-# =============================================================================
+    si = []
+    si.append(["created_at","channel","level","message","extra"])
+    for r in rows:
+        si.append([r["created_at"], r["channel"], r["level"], r["message"], r["extra"]])
 
-def boot_banner():
+    out = []
+    w = csv.writer(out := [])
+    # small trick to avoid io imports; we will build CSV manually
+    # but python CSV writer expects file-like; do a simple join instead:
+    # We'll just build rows by ourselves:
+    csv_lines = []
+    csv_lines.append("created_at,channel,level,message,extra")
+    for r in rows:
+        def esc(x):
+            s = (x or "")
+            s = str(s).replace('"','""')
+            return f'"{s}"'
+        csv_lines.append(",".join([esc(r["created_at"]), esc(r["channel"]), esc(r["level"]), esc(r["message"]), esc(r["extra"])]))
+    body = "\n".join(csv_lines)
+
+    resp = make_response(body)
+    resp.headers["Content-Type"] = "text/csv"
+    resp.headers["Content-Disposition"] = "attachment; filename=logs.csv"
+    return resp
+
+# =============== Telegram Bot (PTB v21) ===============
+PTB_AVAILABLE = False
+try:
+    from telegram import Update
+    from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+    PTB_AVAILABLE = True
+except Exception as e:
+    db_log("telegram", "WARN", "PTB import failed", {"err": str(e)})
+
+TELEGRAM_READY = PTB_AVAILABLE and bool(TELEGRAM_BOT_TOKEN)
+
+async def tg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    username = f"tg:{chat_id}"
+    get_or_create_user(username)
+    await update.message.reply_text(f"Hi! You are registered as {username}. You have credits to use /ask <prompt>.")
+
+async def tg_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Use /ask <your prompt>")
+
+async def tg_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    username = f"tg:{chat_id}"
+    get_or_create_user(username)
+    prompt = " ".join(context.args).strip()
+    if not prompt:
+        await update.message.reply_text("Send: /ask your question")
+        return
+    if not user_has_credits(username, 1):
+        await update.message.reply_text("No credits. Try later.")
+        return
+    if not user_consume_credit(username, 1):
+        await update.message.reply_text("Debit failed, try again.")
+        return
+    out = generate_text(prompt, user=username)
+    await update.message.reply_text(out[:4000])
+
+def start_telegram_polling():
+    if not TELEGRAM_READY:
+        log("INFO", "Telegram: OFF (missing token or PTB)")
+        return
+
+    async def _run():
+        try:
+            app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+            app.add_handler(CommandHandler("start", tg_start))
+            app.add_handler(CommandHandler("help", tg_help))
+            app.add_handler(CommandHandler("ask", tg_ask))
+            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, tg_help))
+            log("INFO", "Telegram handlers registered. Mode: POLLING")
+            db_log("telegram", "INFO", "handlers registered", {})
+            await app.run_polling(close_loop=False)  # single call; await properly
+        except Exception as e:
+            db_log("telegram", "ERROR", "polling crashed", {"err": str(e), "trace": traceback.format_exc()})
+
+    # run in a dedicated thread with its own event loop
+    def thread_target():
+        try:
+            asyncio.run(_run())
+        except Exception as e:
+            db_log("telegram", "ERROR", "thread crash", {"err": str(e)})
+
+    t = threading.Thread(target=thread_target, daemon=True)
+    t.start()
+
+# =============== Startup Logs ===============
+def print_boot_banner():
+    log("INFO", "OpenAI client initialized." if USE_OPENAI else "OpenAI disabled.")
     log("INFO", f"App: {APP_NAME}")
-    log("INFO", f"Public URL: {ENV['PUBLIC_URL']}")
-    log("INFO", f"Brand Page: {ENV['BRAND_DOMAIN']}")
-    log("INFO", f"OpenAI: {'ON' if OPENAI_AVAILABLE else 'OFF'} ({ENV['OPENAI_MODEL']})")
-    log("INFO", f"HF Proxy: {'ON' if HF_AVAILABLE else 'OFF'}")
-    log("INFO", f"Telegram: {'ON' if USE_TELEGRAM else 'OFF'}; Polling: {TELEGRAM_POLLING}")
-    db_log("web", "INFO", "App boot", {"openai": OPENAI_AVAILABLE, "telegram": USE_TELEGRAM})
+    log("INFO", f"Public URL: {PUBLIC_URL}")
+    log("INFO", f"Brand Page: {BRAND_URL}")
+    log("INFO", f"OpenAI: {'ON' if USE_OPENAI else 'OFF'} ({OPENAI_MODEL})")
+    log("INFO", f"HF Proxy: {'ON' if HF_PROXY else 'OFF'}")
+    log("INFO", f"Telegram: {'ON' if TELEGRAM_READY else 'OFF'}; Polling: {TELEGRAM_POLLING}")
 
-# =============================================================================
-# 8) MAIN
-# =============================================================================
-
+# =============== Main ===============
 if __name__ == "__main__":
-    boot_banner()
-    # Start Telegram polling in background (non-async, correct for v21)
-    start_telegram_polling_in_thread()
+    print_boot_banner()
+    # start scheduler
+    start_scheduler_thread()
 
-    # Run Flask
-    # Note: Render uses PORT env and forwards traffic. Built-in server is OK for simple apps.
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    # start telegram polling in background (fixed: no 'never awaited' now)
+    if TELEGRAM_POLLING:
+        start_telegram_polling()
+
+    # serve Flask
+    # Render binds to PORT env; dev run is fine too
+    app.run(host=HOST, port=PORT, debug=False)
