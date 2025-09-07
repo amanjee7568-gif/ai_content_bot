@@ -3627,30 +3627,34 @@ def payments_health():
 # -------------------------------------------------------
 # APP ENTRY POINT
 # -------------------------------------------------------
-import threading
+from flask import Flask, request
 from telegram.ext import Application, CommandHandler
 import os
 
-def run_bot():
-    TOKEN = os.getenv("BOT_TOKEN")
-    if not TOKEN:
-        print("❌ BOT_TOKEN missing, Telegram Bot नहीं चलेगा")
-        return
+app = Flask(__name__)
+TOKEN = os.getenv("BOT_TOKEN")
+application = Application.builder().token(TOKEN).build()
 
-    application = Application.builder().token(TOKEN).build()
+# Basic handler
+async def start(update, context):
+    await update.message.reply_text("🤖 Ganesh A.I. Bot Webhook से चल रहा है!")
 
-    async def start(update, context):
-        await update.message.reply_text("🤖 Ganesh A.I. Bot चालू है 24x7!")
+application.add_handler(CommandHandler("start", start))
 
-    application.add_handler(CommandHandler("start", start))
-
-    application.run_polling()
+# Flask route for Telegram webhook
+@app.route(f"/{TOKEN}", methods=["POST"])
+def telegram_webhook():
+    update = request.get_json(force=True)
+    application.update_queue.put_nowait(update)
+    return "OK"
 
 if __name__ == "__main__":
-    # Start Telegram bot in background
-    bot_thread = threading.Thread(target=run_bot)
-    bot_thread.daemon = True
-    bot_thread.start()
+    port = int(os.getenv("PORT", 10000))
 
-    # Start Flask app normally
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    # पहले webhook register कर
+    import requests
+    url = f"https://{os.getenv('RENDER_EXTERNAL_URL')}/{TOKEN}"
+    requests.get(f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={url}")
+
+    # Flask run
+    app.run(host="0.0.0.0", port=port)
