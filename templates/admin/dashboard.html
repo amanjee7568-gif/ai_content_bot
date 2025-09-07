@@ -1,0 +1,25 @@
+
+<!DOCTYPE html>
+<html>
+<head><title>Admin</title></head>
+<body>
+  <h2>Admin Dashboard</h2>
+  <h3>Users</h3>
+  <ul>
+  {% for u in users %}
+    <li>{{ u['username'] }} | {{ u['email'] }} | Wallet: {{ u['wallet'] }}</li>
+  {% endfor %}
+  </ul>
+  <h3>Payments</h3>
+  <ul>
+  {% for p in payments %}
+    <li>{{ p['provider'] }} | {{ p['amount'] }} | {{ p['status'] }}
+    {% if p['status']=='pending' %}
+      <a href="{{ url_for('approve_payment', pid=p['id']) }}">Approve</a>
+      <a href="{{ url_for('reject_payment', pid=p['id']) }}">Reject</a>
+    {% endif %}
+    </li>
+  {% endfor %}
+  </ul>
+</body>
+</html>
