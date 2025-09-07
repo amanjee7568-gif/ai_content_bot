@@ -1,361 +1,360 @@
+# main.py
+# ─────────────────────────────────────────────────────────────────────────────
+# Ganesh A.I. – Single-file production app:
+# - Flask web (index + /api/generate + admin login + admin dashboard)
+# - Telegram bot (python-telegram-bot v21, polling in background thread)
+# - OpenAI responses (openai>=1.42)
+# - SQLite logs
+# - gTTS optional (toggle via USE_TTS)
+# - No "Updater.start_polling was never awaited" error (no Updater used)
+# - Gunicorn compatible (app = Flask(...) at bottom)
+# ─────────────────────────────────────────────────────────────────────────────
+
 import os
 import json
-import time
-import csv
-import threading
-import asyncio
-import traceback
-from datetime import datetime, timedelta
-from functools import wraps
-
-from flask import Flask, request, jsonify, session, redirect, url_for, render_template_string, make_response, abort
-
-# =============== Logging Helper ===============
-def log(level, msg):
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{ts} | {level:<5} | Ganesh A.I. | {msg}", flush=True)
-
-# =============== ENV & Flags ===============
-APP_NAME = os.getenv("APP_NAME", "Ganesh A.I.")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "https://ai-content-bot.example.com")
-BRAND_URL = os.getenv("BRAND_URL", "https://brand.page/Ganeshagamingworld")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-HF_PROXY = os.getenv("HF_PROXY", "1").strip() in ("1", "true", "True")
-HF_API_URL = os.getenv("HF_API_URL", "http://127.0.0.1:3000")  # optional
-SECRET_KEY = os.getenv("SECRET_KEY", "change_this_secret")
-PORT = int(os.getenv("PORT", "10000"))
-HOST = "0.0.0.0"
-
-# Admin creds (as requested)
-ADMIN_USER = os.getenv("ADMIN_USER", "admin")
-ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
-
-# Telegram
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_POLLING = os.getenv("TELEGRAM_POLLING", "1").strip() in ("1", "true", "True")
-
-# Faucet / Credits
-DAILY_FAUCET = int(os.getenv("DAILY_FAUCET", "25"))  # credits per day
-NEW_USER_CREDITS = int(os.getenv("NEW_USER_CREDITS", "50"))
-
-# =============== Flask App ===============
-app = Flask(__name__)
-app.secret_key = SECRET_KEY
-
-# =============== SQLite DB ===============
 import sqlite3
-DB_FILE = os.getenv("DB_FILE", "data.db")
+import threading
+import traceback
+from datetime import datetime, timezone
+from functools import wraps
+from pathlib import Path
 
-def db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+from flask import (
+    Flask, request, jsonify, redirect, url_for, session,
+    render_template_string, send_from_directory
+)
 
-def init_db():
-    conn = db()
-    cur = conn.cursor()
-    cur.executescript("""
-    CREATE TABLE IF NOT EXISTS users(
+from dotenv import load_dotenv
+from openai import OpenAI
+
+# Telegram v21
+from telegram import Update
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
+)
+
+# Optional TTS
+try:
+    from gtts import gTTS
+    USE_TTS_AVAILABLE = True
+except Exception:
+    USE_TTS_AVAILABLE = False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENV & CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+load_dotenv()
+
+APP_NAME           = os.getenv("APP_NAME", "Ganesh A.I.")
+PUBLIC_URL         = os.getenv("PUBLIC_URL", "https://ai-content-bot.example.com")
+BRAND_PAGE         = os.getenv("BRAND_PAGE", "https://brand.page/Ganeshagamingworld")
+
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL       = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_ENABLED   = os.getenv("TELEGRAM_ENABLED", "true").lower() == "true"
+
+# Admin panel credentials
+ADMIN_USER         = os.getenv("ADMIN_USER", "admin")
+ADMIN_PASS         = os.getenv("ADMIN_PASS", "change-me")
+
+# Flask session secret
+FLASK_SECRET       = os.getenv("FLASK_SECRET", "super-secret-key-change-this")
+
+# Optional features
+USE_TTS            = os.getenv("USE_TTS", "false").lower() == "true" and USE_TTS_AVAILABLE
+
+# DB path
+DB_PATH            = os.getenv("DB_PATH", "app.db")
+
+# Logging level
+LOG_LEVEL          = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# Port (Render/Gunicorn picks $PORT)
+PORT               = int(os.getenv("PORT", "10000"))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UTILITIES / LOGGING
+# ─────────────────────────────────────────────────────────────────────────────
+def now_utc():
+    return datetime.now(timezone.utc)
+
+def ts():
+    return now_utc().strftime("%Y-%m-%d %H:%M:%S")
+
+def log(level, *parts, **kv):
+    level = level.upper()
+    if level not in ("DEBUG", "INFO", "WARN", "ERROR"):
+        level = "INFO"
+    if {"DEBUG":0,"INFO":1,"WARN":2,"ERROR":3}[level] < {"DEBUG":0,"INFO":1,"WARN":2,"ERROR":3}[LOG_LEVEL]:
+        return
+    msg = " ".join(str(p) for p in parts)
+    if kv:
+        msg += " | " + json.dumps(kv, ensure_ascii=False)
+    print(f"{ts()} | {level:5s} | {APP_NAME} | {msg}", flush=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DB (SQLite)
+# ─────────────────────────────────────────────────────────────────────────────
+def db_init():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE,
-        credits INTEGER DEFAULT 0,
-        telegram_chat_id TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS logs(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        channel TEXT,
+        t TIMESTAMP,
+        ch TEXT,        -- channel: web/telegram/system
         level TEXT,
-        message TEXT,
-        extra JSON,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS settings(
-        key TEXT PRIMARY KEY,
-        value TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS chats(
+        event TEXT,
+        meta TEXT
+    )
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS queries (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user TEXT,
+        t TIMESTAMP,
+        source TEXT,    -- web or telegram
         prompt TEXT,
-        response TEXT,
-        tokens_in INTEGER DEFAULT 0,
-        tokens_out INTEGER DEFAULT 0,
-        provider TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
+        response TEXT
+    )
     """)
     conn.commit()
     conn.close()
 
-def db_log(channel, level, message, extra=None):
+def db_log(ch, level, event, meta=None):
     try:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("INSERT INTO logs(channel, level, message, extra) VALUES (?,?,?,?)",
-                    (channel, level, message, json.dumps(extra or {})))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        log("ERROR", f"db_log failed: {e}")
-
-init_db()
-
-# =============== OpenAI Client ===============
-USE_OPENAI = bool(OPENAI_API_KEY)
-if USE_OPENAI:
-    try:
-        from openai import OpenAI
-        oai = OpenAI(api_key=OPENAI_API_KEY)
-        log("INFO", "OpenAI client initialized.")
-    except Exception as e:
-        log("ERROR", f"OpenAI init failed: {e}")
-        USE_OPENAI = False
-else:
-    log("INFO", "OpenAI: OFF (no API key)")
-
-# =============== Simple Model Call Abstractions ===============
-def call_openai(prompt):
-    if not USE_OPENAI:
-        return "OpenAI key missing. Please set OPENAI_API_KEY."
-    try:
-        # lightweight responses
-        r = oai.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role": "system", "content": "You are a helpful assistant."},
-                      {"role": "user", "content": prompt}],
-            temperature=0.6,
-            max_tokens=500
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO logs (t, ch, level, event, meta) VALUES (?, ?, ?, ?, ?)",
+            (ts(), ch, level, event, json.dumps(meta or {}, ensure_ascii=False))
         )
-        return r.choices[0].message.content.strip()
-    except Exception as e:
-        db_log("openai", "ERROR", "openai call failed", {"err": str(e)})
-        return f"[OpenAI Error] {e}"
-
-def call_hf_proxy(prompt):
-    # Dummy fallback implementation; user’s infra can point HF_API_URL to a TGI server.
-    # Here we just echo if proxy is unreachable.
-    try:
-        import httpx
-        with httpx.Client(timeout=15.0) as client:
-            resp = client.post(f"{HF_API_URL}/generate", json={"inputs": prompt})
-            if resp.status_code == 200:
-                data = resp.json()
-                # accept both TGI style and generic
-                if isinstance(data, dict) and "generated_text" in data:
-                    return data["generated_text"]
-                if isinstance(data, list) and data and "generated_text" in data[0]:
-                    return data[0]["generated_text"]
-                return str(data)
-            return f"[HF Proxy HTTP {resp.status_code}] {resp.text}"
-    except Exception as e:
-        db_log("hf", "ERROR", "hf proxy failed", {"err": str(e)})
-        return "[HF Proxy Error] (falling back) " + str(e)
-
-def generate_text(prompt, user="web"):
-    provider = "openai" if USE_OPENAI else ("hf-proxy" if HF_PROXY else "local-echo")
-    if provider == "openai":
-        out = call_openai(prompt)
-    elif provider == "hf-proxy":
-        out = call_hf_proxy(prompt)
-    else:
-        out = f"(echo) {prompt}"
-
-    # save chat
-    try:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("INSERT INTO chats(user, prompt, response, tokens_in, tokens_out, provider) VALUES (?,?,?,?,?,?)",
-                    (user, prompt, out, len(prompt.split()), len(out.split()), provider))
         conn.commit()
         conn.close()
     except Exception as e:
-        db_log("db", "ERROR", "save chat failed", {"err": str(e)})
-    return out
+        log("ERROR", "db_log failed", err=str(e))
 
-# =============== Credits Helpers ===============
-def get_or_create_user(username):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE username=?", (username,))
-    row = cur.fetchone()
-    if row:
-        conn.close()
-        return dict(row)
-    # create
-    cur.execute("INSERT INTO users(username, credits) VALUES (?,?)", (username, NEW_USER_CREDITS))
-    conn.commit()
-    cur.execute("SELECT * FROM users WHERE username=?", (username,))
-    row = cur.fetchone()
-    conn.close()
-    return dict(row)
-
-def user_add_credits(username, delta):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET credits = COALESCE(credits,0)+? WHERE username=?", (delta, username))
-    conn.commit()
-    conn.close()
-
-def user_has_credits(username, need=1):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT credits FROM users WHERE username=?", (username,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return False
-    return (row["credits"] or 0) >= need
-
-def user_consume_credit(username, cost=1):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET credits = credits - ? WHERE username=? AND credits >= ?",
-                (cost, username, cost))
-    ok = cur.rowcount > 0
-    conn.commit()
-    conn.close()
-    return ok
-
-# =============== Scheduler (Daily Faucet) ===============
-def faucet_job():
+def db_save_query(source, prompt, response):
     try:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET credits = COALESCE(credits,0) + ?", (DAILY_FAUCET,))
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO queries (t, source, prompt, response) VALUES (?, ?, ?, ?)",
+            (ts(), source, prompt, response)
+        )
         conn.commit()
         conn.close()
-        db_log("scheduler", "INFO", f"Daily faucet +{DAILY_FAUCET} credits added to all users", {})
     except Exception as e:
-        db_log("scheduler", "ERROR", "faucet job failed", {"err": str(e)})
+        log("ERROR", "db_save_query failed", err=str(e))
 
-def start_scheduler_thread():
-    def loop():
-        while True:
-            try:
-                faucet_job()
-            except Exception as e:
-                log("ERROR", f"Scheduler error: {e}")
-            time.sleep(24 * 3600)
-    t = threading.Thread(target=loop, daemon=True)
-    t.start()
+# ─────────────────────────────────────────────────────────────────────────────
+# OPENAI CLIENT
+# ─────────────────────────────────────────────────────────────────────────────
+if not OPENAI_API_KEY:
+    log("WARN", "OPENAI_API_KEY missing. /api/generate will fail without it.")
 
-# =============== HTML Templates (inline) ===============
-HOME_HTML = """
+try:
+    oai = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+    if oai:
+        log("INFO", "OpenAI client initialized.")
+except Exception as e:
+    oai = None
+    log("ERROR", "OpenAI init failed", err=str(e))
+
+async def llm_generate(prompt: str) -> str:
+    """
+    Generate text using OpenAI chat.completions.
+    """
+    if not oai:
+        return "OpenAI client not configured. Please set OPENAI_API_KEY."
+    try:
+        resp = oai.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant for scripts and content."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=700
+        )
+        text = resp.choices[0].message.content.strip()
+        return text
+    except Exception as e:
+        log("ERROR", "OpenAI error", err=str(e), trace=traceback.format_exc())
+        return f"OpenAI error: {e}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FLASK APP + TEMPLATES
+# ─────────────────────────────────────────────────────────────────────────────
+app = Flask(__name__)
+app.secret_key = FLASK_SECRET
+
+INDEX_HTML = """
 <!doctype html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="utf-8" />
+  <meta charset="utf-8"/>
   <title>{{ app_name }}</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <link rel="icon" href="/favicon.ico">
   <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#0b1220;color:#e6edf3}
-    header{display:flex;justify-content:space-between;align-items:center;padding:16px 22px;border-bottom:1px solid #1e2a44;background:#0e1628}
-    .brand a{color:#9bc1ff;text-decoration:none;font-weight:600}
-    .container{max-width:860px;margin:24px auto;padding:0 16px}
-    .card{background:#101a33;border:1px solid #1e2a44;border-radius:14px;padding:14px 14px 12px 14px;margin-bottom:14px}
-    textarea{width:100%;min-height:110px;background:#0b1220;border:1px solid #21314f;border-radius:10px;padding:12px;color:#e6edf3;resize:vertical}
-    button{border:0;border-radius:10px;padding:10px 14px;font-weight:600;cursor:pointer}
-    .btn{background:#2f6feb;color:#fff}
+    :root { --bg:#0b1220; --card:#121a2a; --muted:#a7b3c6; --text:#eaf0ff; --brand:#6ca3ff; }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial}
+    .wrap{max-width:880px;margin:40px auto;padding:0 16px}
+    .card{background:var(--card);border:1px solid #1d2a44;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+    header{display:flex;align-items:center;gap:12px}
+    header img{width:40px;height:40px}
+    .title{font-size:26px;font-weight:700}
+    .muted{color:var(--muted)}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .btn{background:var(--brand);color:#04122d;border:none;border-radius:10px;padding:12px 16px;font-weight:700;cursor:pointer}
     .btn:disabled{opacity:.6;cursor:not-allowed}
-    .row{display:flex;gap:10px;flex-wrap:wrap}
-    .row>*{flex:1}
-    #out{white-space:pre-wrap;line-height:1.45}
-    .muted{color:#9aa8c1;font-size:13px}
-    .hist{max-height:260px;overflow:auto;border:1px solid #1e2a44;border-radius:10px;padding:8px}
-    .chip{display:inline-block;background:#0e1b34;border:1px solid #24426c;color:#b4cfff;border-radius:999px;padding:5px 10px;margin:4px 6px 0 0;font-size:12px;cursor:pointer}
-    .topline{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-    .badge{font-size:12px;background:#102040;border:1px solid #1f3a66;border-radius:999px;padding:4px 8px;color:#9bc1ff}
+    input,select,textarea{background:#0c1426;color:var(--text);border:1px solid #1d2a44;border-radius:10px;padding:12px;width:100%}
+    textarea{min-height:140px;resize:vertical}
+    .out{white-space:pre-wrap;background:#0a0f1a;border-radius:10px;padding:12px;border:1px solid #1d2a44}
+    a.brand{color:var(--brand);text-decoration:none}
+    .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;padding:12px 16px;border-bottom:1px solid #1d2a44}
+    .footer{margin:24px 0;color:var(--muted);font-size:13px;text-align:center}
   </style>
 </head>
 <body>
-<header>
-  <div class="brand"><a href="{{ brand_url }}" target="_blank">{{ app_name }}</a></div>
-  <div><a class="badge" href="/admin">Admin</a></div>
-</header>
-<div class="container">
-  <div class="card">
-    <div class="topline">
-      <div><strong>Ask anything</strong></div>
-      <div class="badge">Model: {{ model }}</div>
-      <div class="badge">HF Proxy: {{ 'ON' if hf_proxy else 'OFF' }}</div>
-    </div>
-    <p class="muted">Type your prompt below and hit Generate. History stays for this page session only.</p>
-    <textarea id="in" placeholder="Write your prompt..."></textarea>
-    <div class="row" style="margin-top:8px">
-      <button id="go" class="btn">Generate</button>
-      <button id="clr">Clear</button>
-    </div>
-    <div id="out" class="card" style="margin-top:12px"></div>
-  </div>
+<div class="wrap">
 
   <div class="card">
-    <div style="display:flex;justify-content:space-between;align-items:center">
-      <strong>Quick History</strong>
-      <button id="clearHist">Clear History</button>
+    <div class="topbar">
+      <header>
+        <img src="https://cdn-icons-png.flaticon.com/512/4712/4712027.png" alt="logo"/>
+        <div>
+          <div class="title">{{ app_name }}</div>
+          <div class="muted">Smart content & script maker</div>
+        </div>
+      </header>
+      <div><a class="brand" href="{{ brand_page }}" target="_blank">Brand Page ↗</a></div>
     </div>
-    <div id="hist" class="hist"></div>
+
+    <div style="padding:16px">
+      <div class="row">
+        <div>
+          <label>Topic / Prompt</label>
+          <input id="prompt" placeholder="e.g. PUBG montage video script in Hinglish"/>
+        </div>
+        <div>
+          <label>Preset</label>
+          <select id="preset">
+            <option value="script">Video Script</option>
+            <option value="caption">YouTube Caption</option>
+            <option value="ideas">Title Ideas</option>
+            <option value="shorts">Shorts Hook</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:12px">
+        <div>
+          <label>Style / Tone</label>
+          <input id="style" placeholder="Energetic, Hinglish, Gen-Z"/>
+        </div>
+        <div>
+          <label>Duration / Length</label>
+          <select id="length">
+            <option value="short">Short (30-60s)</option>
+            <option value="med">Medium (2-5 min)</option>
+            <option value="long">Long (8-12 min)</option>
+          </select>
+        </div>
+      </div>
+
+      <div style="margin-top:12px">
+        <label>Extra Notes</label>
+        <textarea id="notes" placeholder="Anything specific to include?"></textarea>
+      </div>
+
+      <div style="display:flex;gap:12px;align-items:center;margin-top:12px">
+        <button id="btnGen" class="btn">⚡ Generate</button>
+        <button id="btnSearch" class="btn" title="Quick variation">🔎 Search / Remix</button>
+        <span id="status" class="muted"></span>
+      </div>
+
+      <div id="output" class="out" style="margin-top:16px;min-height:120px"></div>
+    </div>
   </div>
+
+  <div class="footer">
+    © {{ year }} · <a class="brand" href="{{ public_url }}" target="_blank">{{ public_url }}</a>
+    · <a class="brand" href="/admin">Admin</a>
+  </div>
+
 </div>
 
 <script>
-  const $in = document.getElementById('in');
-  const $out = document.getElementById('out');
-  const $go = document.getElementById('go');
-  const $clr = document.getElementById('clr');
-  const $hist = document.getElementById('hist');
-  const $clearHist = document.getElementById('clearHist');
+async function postJSON(url, data) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(data)
+  });
+  return await r.json();
+}
 
-  let historyList = JSON.parse(localStorage.getItem('hist')||'[]');
+function buildPrompt() {
+  const topic  = document.getElementById("prompt").value.trim();
+  const preset = document.getElementById("preset").value;
+  const style  = document.getElementById("style").value.trim();
+  const length = document.getElementById("length").value;
+  const notes  = document.getElementById("notes").value.trim();
 
-  function renderHist(){
-    $hist.innerHTML = '';
-    historyList.slice().reverse().forEach(h=>{
-      const div = document.createElement('span');
-      div.className='chip';
-      div.textContent = h.prompt.slice(0,80);
-      div.title = 'Click to reuse';
-      div.onclick = ()=>{$in.value = h.prompt;};
-      $hist.appendChild(div);
-    });
+  let sys = "";
+  if (preset === "script") {
+    sys = "Create a tight, timestamped YouTube script with scene beats, VO lines, and B-roll suggestions.";
+  } else if (preset === "caption") {
+    sys = "Write a catchy YouTube description + 10 SEO tags.";
+  } else if (preset === "ideas") {
+    sys = "Give 15 viral, SEO-friendly video title ideas.";
+  } else if (preset === "shorts") {
+    sys = "Write 5 ultra-hooky shorts scripts (<=20s) with punchy lines.";
   }
-  renderHist();
 
-  $clearHist.onclick = ()=>{
-    historyList = [];
-    localStorage.setItem('hist', JSON.stringify(historyList));
-    renderHist();
-  };
+  return `${sys}\n\nTopic: ${topic}\nStyle: ${style || "Hinglish"}\nLength: ${length}\nNotes: ${notes}`;
+}
 
-  $clr.onclick = ()=>{ $in.value=''; $out.textContent=''; };
+async function generate() {
+  const status = document.getElementById("status");
+  const out    = document.getElementById("output");
+  const btn    = document.getElementById("btnGen");
+  btn.disabled = true;
+  status.textContent = "Generating…";
+  out.textContent = "";
 
-  $go.onclick = async ()=>{
-    const prompt = $in.value.trim();
-    if(!prompt){ alert('Enter prompt'); return; }
-    $go.disabled = true;
-    $out.textContent = 'Generating...';
-    try{
-      const r = await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt, user:'web'})});
-      const j = await r.json();
-      if(j.ok){
-        $out.textContent = j.data;
-        historyList.push({prompt, ts:Date.now()});
-        historyList = historyList.slice(-50);
-        localStorage.setItem('hist', JSON.stringify(historyList));
-        renderHist();
-      }else{
-        $out.textContent = 'Error: ' + (j.error||'unknown');
-      }
-    }catch(e){
-      $out.textContent = 'Network error: '+e;
-    }finally{
-      $go.disabled = false;
+  const prompt = buildPrompt();
+  try {
+    const res = await postJSON("/api/generate", { prompt });
+    if (res.ok) {
+      out.textContent = res.text || "(empty)";
+    } else {
+      out.textContent = "Error: " + (res.error || "unknown");
     }
-  };
+  } catch (e) {
+    out.textContent = "Network error: " + e;
+  } finally {
+    btn.disabled = false;
+    status.textContent = "";
+  }
+}
+
+async function remix() {
+  const prompt = document.getElementById("prompt");
+  if (!prompt.value.trim()) {
+    prompt.value = "Gaming highlights video with funny commentary";
+  } else {
+    prompt.value = prompt.value + " (make it funnier, faster-paced)";
+  }
+  await generate();
+}
+
+document.getElementById("btnGen").addEventListener("click", generate);
+document.getElementById("btnSearch").addEventListener("click", remix);
 </script>
 </body>
 </html>
@@ -363,394 +362,265 @@ HOME_HTML = """
 
 ADMIN_LOGIN_HTML = """
 <!doctype html>
-<html><head><meta charset="utf-8"/><title>Admin Login</title>
+<html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Admin Login</title>
 <style>
- body{font-family:system-ui;margin:0;background:#0b1220;color:#e6edf3}
- .wrap{max-width:420px;margin:8% auto;background:#101a33;border:1px solid #1e2a44;border-radius:14px;padding:18px}
- input{width:100%;padding:10px;border-radius:10px;border:1px solid #2a3c61;background:#0b1220;color:#e6edf3;margin:6px 0}
- button{width:100%;padding:10px;border:0;border-radius:10px;background:#2f6feb;color:#fff;font-weight:700}
- .muted{color:#9aa8c1}
- .err{color:#ff9aa2;margin:6px 0 0 0}
-</style></head>
-<body>
-<div class="wrap">
-  <h3>Admin Login</h3>
-  <form method="post">
-    <input name="username" placeholder="Username" autocomplete="username" />
-    <input name="password" type="password" placeholder="Password" autocomplete="current-password" />
-    <button>Login</button>
-    {% if err %}<div class="err">{{ err }}</div>{% endif %}
-    <p class="muted" style="margin-top:12px">Default: admin / admin123 (change in .env)</p>
-  </form>
-</div>
+  body{background:#0b1220;font-family:Inter,system-ui;display:flex;align-items:center;justify-content:center;height:100vh;color:#eaf0ff}
+  .card{background:#121a2a;border:1px solid #1d2a44;border-radius:16px;padding:24px;min-width:320px}
+  input{width:100%;padding:12px;border-radius:10px;border:1px solid #1d2a44;background:#0c1426;color:#eaf0ff;margin-top:8px}
+  .btn{width:100%;padding:12px;border-radius:10px;border:none;background:#6ca3ff;color:#04122d;font-weight:700;margin-top:12px}
+  .muted{color:#a7b3c6}
+</style>
+</head><body>
+  <div class="card">
+    <h2>Admin Login</h2>
+    <form method="post">
+      <label>Username</label>
+      <input name="username" autofocus/>
+      <label style="margin-top:6px">Password</label>
+      <input name="password" type="password"/>
+      <button class="btn" type="submit">Login</button>
+    </form>
+    {% if error %}<div class="muted" style="margin-top:10px;color:#ff9b9b">{{ error }}</div>{% endif %}
+  </div>
 </body></html>
 """
 
-ADMIN_DASH_HTML = """
+ADMIN_DASHBOARD_HTML = """
 <!doctype html>
-<html><head><meta charset="utf-8"/><title>Admin</title>
+<html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Admin · {{ app_name }}</title>
 <style>
- body{font-family:system-ui;margin:0;background:#0b1220;color:#e6edf3}
- header{display:flex;justify-content:space-between;align-items:center;padding:16px 22px;border-bottom:1px solid #1e2a44;background:#0e1628}
- .container{max-width:980px;margin:20px auto;padding:0 16px}
- .card{background:#101a33;border:1px solid #1e2a44;border-radius:14px;padding:14px;margin:12px 0}
- input,select{padding:8px;border-radius:8px;border:1px solid #22375e;background:#0b1220;color:#e6edf3}
- button{padding:8px 12px;border-radius:8px;border:0;background:#2f6feb;color:#fff;cursor:pointer}
- table{width:100%;border-collapse:collapse}
- th,td{border-bottom:1px solid #1e2a44;padding:8px;text-align:left;font-size:14px}
- .row{display:flex;gap:10px;flex-wrap:wrap}
- .muted{color:#9aa8c1}
- .badge{font-size:12px;background:#102040;border:1px solid #1f3a66;border-radius:999px;padding:4px 8px;color:#9bc1ff}
- a{color:#9bc1ff}
-</style></head>
-<body>
-<header>
-  <div><strong>Admin</strong> <span class="badge">{{ app_name }}</span></div>
-  <div>
-    <a class="badge" href="/">Home</a>
-    <a class="badge" href="/admin/logout">Logout</a>
-  </div>
-</header>
-<div class="container">
-
-  <div class="card">
-    <h3>Quick Stats</h3>
-    <div class="row">
-      <div>Total users: <strong>{{ stats.total_users }}</strong></div>
-      <div>Total chats: <strong>{{ stats.total_chats }}</strong></div>
-      <div>OpenAI: <strong>{{ 'ON' if use_openai else 'OFF' }}</strong></div>
-      <div>HF Proxy: <strong>{{ 'ON' if hf_proxy else 'OFF' }}</strong></div>
-      <div>Model: <strong>{{ model }}</strong></div>
+  body{background:#0b1220;color:#eaf0ff;font-family:Inter,system-ui}
+  .wrap{max-width:980px;margin:30px auto;padding:0 16px}
+  .card{background:#121a2a;border:1px solid #1d2a44;border-radius:16px;padding:16px}
+  table{width:100%;border-collapse:collapse}
+  th,td{border-bottom:1px solid #1d2a44;padding:8px;text-align:left;font-size:14px}
+  .top{display:flex;justify-content:space-between;align-items:center}
+  a.btn{background:#6ca3ff;color:#04122d;text-decoration:none;padding:8px 12px;border-radius:8px}
+  .muted{color:#a7b3c6}
+</style>
+</head><body>
+  <div class="wrap">
+    <div class="top">
+      <h2>Admin · {{ app_name }}</h2>
+      <div>
+        <a class="btn" href="/">Home</a>
+        <a class="btn" href="/admin/logout">Logout</a>
+      </div>
     </div>
-  </div>
 
-  <div class="card">
-    <h3>Users</h3>
-    <form class="row" method="post" action="/admin/create_user">
-      <input name="username" placeholder="username" required />
-      <input name="credits" type="number" placeholder="credits" value="50" />
-      <button>Create</button>
-    </form>
-    <form class="row" style="margin-top:8px" method="post" action="/admin/add_credits">
-      <input name="username" placeholder="username" required />
-      <input name="delta" type="number" placeholder="+/- credits" value="10" />
-      <button>Adjust</button>
-    </form>
-    <div style="overflow:auto;max-height:320px;margin-top:10px">
+    <div class="card" style="margin-top:16px">
+      <h3>Latest Queries</h3>
       <table>
-        <thead><tr><th>Username</th><th>Credits</th><th>Telegram</th><th>Created</th></tr></thead>
+        <thead><tr><th>Time</th><th>Source</th><th>Prompt</th><th>Response (first 120 chars)</th></tr></thead>
         <tbody>
-          {% for u in users %}
+        {% for q in queries %}
           <tr>
-            <td>{{ u['username'] }}</td>
-            <td>{{ u['credits'] }}</td>
-            <td>{{ u['telegram_chat_id'] or '' }}</td>
-            <td>{{ u['created_at'] }}</td>
+            <td class="muted">{{ q.t }}</td>
+            <td>{{ q.source }}</td>
+            <td>{{ q.prompt[:80] }}</td>
+            <td class="muted">{{ (q.response or "")[:120] }}</td>
           </tr>
-          {% endfor %}
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <h3>Logs</h3>
+      <table>
+        <thead><tr><th>Time</th><th>Ch</th><th>Level</th><th>Event</th><th>Meta</th></tr></thead>
+        <tbody>
+        {% for l in logs %}
+          <tr>
+            <td class="muted">{{ l.t }}</td>
+            <td>{{ l.ch }}</td>
+            <td>{{ l.level }}</td>
+            <td>{{ l.event }}</td>
+            <td class="muted">{{ l.meta }}</td>
+          </tr>
+        {% endfor %}
         </tbody>
       </table>
     </div>
   </div>
-
-  <div class="card">
-    <h3>Recent Logs</h3>
-    <div style="overflow:auto;max-height:260px">
-      <table>
-        <thead><tr><th>When</th><th>Chan</th><th>Level</th><th>Message</th></tr></thead>
-        <tbody>
-          {% for l in logs %}
-          <tr>
-            <td>{{ l['created_at'] }}</td>
-            <td>{{ l['channel'] }}</td>
-            <td>{{ l['level'] }}</td>
-            <td>{{ l['message'] }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-    <div class="row" style="margin-top:8px">
-      <a class="badge" href="/admin/export_logs">Export CSV</a>
-    </div>
-  </div>
-
-  <div class="card">
-    <h3>Settings</h3>
-    <form class="row" method="post" action="/admin/save_settings">
-      <input name="key" placeholder="key (e.g. announcement)" />
-      <input name="value" placeholder="value" />
-      <button>Save</button>
-    </form>
-    <p class="muted">Stored in SQLite settings table.</p>
-  </div>
-
-</div>
 </body></html>
 """
 
-# =============== Auth Decorator ===============
-def admin_required(f):
-    @wraps(f)
-    def w(*a, **k):
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTH DECORATOR
+# ─────────────────────────────────────────────────────────────────────────────
+def require_admin(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
         if not session.get("admin_ok"):
             return redirect(url_for("admin_login"))
-        return f(*a, **k)
-    return w
+        return fn(*args, **kwargs)
+    return wrapper
 
-# =============== Routes: Public ===============
-@app.route("/")
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUTES
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/")
 def home():
-    return render_template_string(
-        HOME_HTML,
-        app_name=APP_NAME,
-        brand_url=BRAND_URL,
-        model=OPENAI_MODEL,
-        hf_proxy=HF_PROXY
-    )
+    return render_template_string(INDEX_HTML,
+                                  app_name=APP_NAME,
+                                  public_url=PUBLIC_URL,
+                                  brand_page=BRAND_PAGE,
+                                  year=datetime.now().year)
 
-@app.route("/api/health")
-def api_health():
-    return jsonify(ok=True, app=APP_NAME, openai=USE_OPENAI, hf_proxy=HF_PROXY, model=OPENAI_MODEL)
+@app.get("/favicon.ico")
+def favicon():
+    # Optional local favicon support (returns 204 if none)
+    static_dir = Path("static")
+    ico = static_dir / "favicon.ico"
+    if ico.exists():
+        return send_from_directory(str(static_dir), "favicon.ico")
+    return ("", 204)
 
-@app.route("/api/generate", methods=["POST"])
+@app.post("/api/generate")
 def api_generate():
+    data = request.get_json(force=True, silent=True) or {}
+    prompt = (data.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify(ok=False, error="Empty prompt"), 400
+
+    db_log("web", "INFO", "generate", {"prompt": prompt})
+
+    # Run LLM sync via async helper (use a tiny loop)
     try:
-        data = request.get_json(force=True)
-        prompt = (data.get("prompt") or "").strip()
-        username = (data.get("user") or "web").strip()
-        if not prompt:
-            return jsonify(ok=False, error="empty prompt"), 400
+        import asyncio
+        text = asyncio.run(llm_generate(prompt))
+    except RuntimeError:
+        # If we're already in an event loop (rare in gunicorn workers), use new loop
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        text = loop.run_until_complete(llm_generate(prompt))
 
-        u = get_or_create_user(username)
-        if not user_has_credits(username, 1):
-            return jsonify(ok=False, error="No credits. Try later."), 402
+    db_save_query("web", prompt, text)
+    return jsonify(ok=True, text=text)
 
-        ok = user_consume_credit(username, 1)
-        if not ok:
-            return jsonify(ok=False, error="Credit debit failed"), 500
+# ── Admin
+@app.get("/admin")
+@require_admin
+def admin():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT t, source, prompt, response FROM queries ORDER BY id DESC LIMIT 40")
+    queries = c.fetchall()
+    c.execute("SELECT t, ch, level, event, meta FROM logs ORDER BY id DESC LIMIT 60")
+    logs = c.fetchall()
+    conn.close()
+    return render_template_string(ADMIN_DASHBOARD_HTML,
+                                  app_name=APP_NAME,
+                                  queries=queries,
+                                  logs=logs)
 
-        out = generate_text(prompt, user=username)
-        return jsonify(ok=True, data=out)
-    except Exception as e:
-        db_log("api", "ERROR", "generate failed", {"err": str(e), "trace": traceback.format_exc()})
-        return jsonify(ok=False, error=str(e)), 500
-
-# =============== Routes: Admin ===============
-@app.route("/admin")
-def admin_root():
-    if not session.get("admin_ok"):
-        return redirect(url_for("admin_login"))
-    return redirect(url_for("admin_dashboard"))
-
-@app.route("/admin/login", methods=["GET", "POST"])
+@app.get("/admin/login")
 def admin_login():
-    err = None
-    if request.method == "POST":
-        u = request.form.get("username", "")
-        p = request.form.get("password", "")
-        # **IMPORTANT**: EXACT match with ENV (user report: "incorrect")
-        if u == ADMIN_USER and p == ADMIN_PASS:
-            session["admin_ok"] = True
-            db_log("admin", "INFO", "login success", {"user": u})
-            return redirect(url_for("admin_dashboard"))
-        err = "Incorrect username or password"
-        db_log("admin", "WARN", "login failed", {"user": u})
-    return render_template_string(ADMIN_LOGIN_HTML, err=err)
+    return render_template_string(ADMIN_LOGIN_HTML, error=None)
 
-@app.route("/admin/logout")
+@app.post("/admin/login")
+def admin_login_post():
+    username = request.form.get("username", "")
+    password = request.form.get("password", "")
+    if username == ADMIN_USER and password == ADMIN_PASS:
+        session["admin_ok"] = True
+        db_log("web", "INFO", "admin_login_ok", {"user": username})
+        return redirect(url_for("admin"))
+    db_log("web", "WARN", "admin_login_fail", {"user": username})
+    return render_template_string(ADMIN_LOGIN_HTML, error="गलत username/password")
+
+@app.get("/admin/logout")
 def admin_logout():
-    session.clear()
+    session.pop("admin_ok", None)
     return redirect(url_for("admin_login"))
 
-@app.route("/admin/dashboard")
-@admin_required
-def admin_dashboard():
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(1) AS n FROM users")
-    total_users = cur.fetchone()["n"]
-    cur.execute("SELECT COUNT(1) AS n FROM chats")
-    total_chats = cur.fetchone()["n"]
-    cur.execute("SELECT username, credits, telegram_chat_id, created_at FROM users ORDER BY id DESC LIMIT 100")
-    users = [dict(r) for r in cur.fetchall()]
-    cur.execute("SELECT created_at, channel, level, message FROM logs ORDER BY id DESC LIMIT 100")
-    logs = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    return render_template_string(ADMIN_DASH_HTML,
-                                  app_name=APP_NAME,
-                                  stats={"total_users": total_users, "total_chats": total_chats},
-                                  users=users, logs=logs,
-                                  use_openai=USE_OPENAI, hf_proxy=HF_PROXY, model=OPENAI_MODEL)
+# ─────────────────────────────────────────────────────────────────────────────
+# TELEGRAM BOT (Polling, v21 API)
+# ─────────────────────────────────────────────────────────────────────────────
+telegram_app = None
+telegram_thread = None
 
-@app.route("/admin/create_user", methods=["POST"])
-@admin_required
-def admin_create_user():
-    username = request.form.get("username","").strip()
-    credits = int(request.form.get("credits","0") or "0")
-    if not username:
-        return redirect(url_for("admin_dashboard"))
+async def tg_cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Namaste! Main Ganesh A.I. hoon 👋\n"
+        "Bas apna topic ya idea bhejo, main script/caption bana dunga."
+    )
+
+async def tg_cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "/start – greeting\n"
+        "Just send any topic to generate a script.\n"
+        "Example: 'BGMI montage with roast-style commentary'"
+    )
+
+async def tg_on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    db_log("telegram", "INFO", "msg", {"from": update.effective_user.id, "text": text})
+    await update.message.chat.send_action("typing")
     try:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("INSERT INTO users(username, credits) VALUES (?,?)", (username, credits))
-        conn.commit()
-        conn.close()
-        db_log("admin", "INFO", "user created", {"u": username, "c": credits})
+        reply = await llm_generate(f"Telegram user asked:\n\n{text}")
     except Exception as e:
-        db_log("admin", "ERROR", "create_user failed", {"err": str(e)})
-    return redirect(url_for("admin_dashboard"))
-
-@app.route("/admin/add_credits", methods=["POST"])
-@admin_required
-def admin_add_credits():
-    username = request.form.get("username","").strip()
-    delta = int(request.form.get("delta","0") or "0")
-    if username and delta:
-        try:
-            user_add_credits(username, delta)
-            db_log("admin", "INFO", "credits adjusted", {"u": username, "delta": delta})
-        except Exception as e:
-            db_log("admin", "ERROR", "add_credits failed", {"err": str(e)})
-    return redirect(url_for("admin_dashboard"))
-
-@app.route("/admin/save_settings", methods=["POST"])
-@admin_required
-def admin_save_settings():
-    k = (request.form.get("key") or "").strip()
-    v = (request.form.get("value") or "").strip()
-    if not k:
-        return redirect(url_for("admin_dashboard"))
-    try:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, v))
-        conn.commit()
-        conn.close()
-        db_log("admin", "INFO", "setting saved", {"k": k})
-    except Exception as e:
-        db_log("admin", "ERROR", "save_settings failed", {"err": str(e)})
-    return redirect(url_for("admin_dashboard"))
-
-@app.route("/admin/export_logs")
-@admin_required
-def admin_export_logs():
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT created_at, channel, level, message, extra FROM logs ORDER BY id DESC LIMIT 5000")
-    rows = cur.fetchall()
-    conn.close()
-
-    si = []
-    si.append(["created_at","channel","level","message","extra"])
-    for r in rows:
-        si.append([r["created_at"], r["channel"], r["level"], r["message"], r["extra"]])
-
-    out = []
-    w = csv.writer(out := [])
-    # small trick to avoid io imports; we will build CSV manually
-    # but python CSV writer expects file-like; do a simple join instead:
-    # We'll just build rows by ourselves:
-    csv_lines = []
-    csv_lines.append("created_at,channel,level,message,extra")
-    for r in rows:
-        def esc(x):
-            s = (x or "")
-            s = str(s).replace('"','""')
-            return f'"{s}"'
-        csv_lines.append(",".join([esc(r["created_at"]), esc(r["channel"]), esc(r["level"]), esc(r["message"]), esc(r["extra"])]))
-    body = "\n".join(csv_lines)
-
-    resp = make_response(body)
-    resp.headers["Content-Type"] = "text/csv"
-    resp.headers["Content-Disposition"] = "attachment; filename=logs.csv"
-    return resp
-
-# =============== Telegram Bot (PTB v21) ===============
-PTB_AVAILABLE = False
-try:
-    from telegram import Update
-    from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-    PTB_AVAILABLE = True
-except Exception as e:
-    db_log("telegram", "WARN", "PTB import failed", {"err": str(e)})
-
-TELEGRAM_READY = PTB_AVAILABLE and bool(TELEGRAM_BOT_TOKEN)
-
-async def tg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    username = f"tg:{chat_id}"
-    get_or_create_user(username)
-    await update.message.reply_text(f"Hi! You are registered as {username}. You have credits to use /ask <prompt>.")
-
-async def tg_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Use /ask <your prompt>")
-
-async def tg_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    username = f"tg:{chat_id}"
-    get_or_create_user(username)
-    prompt = " ".join(context.args).strip()
-    if not prompt:
-        await update.message.reply_text("Send: /ask your question")
-        return
-    if not user_has_credits(username, 1):
-        await update.message.reply_text("No credits. Try later.")
-        return
-    if not user_consume_credit(username, 1):
-        await update.message.reply_text("Debit failed, try again.")
-        return
-    out = generate_text(prompt, user=username)
-    await update.message.reply_text(out[:4000])
+        reply = f"Error: {e}"
+    db_save_query("telegram", text, reply)
+    await update.message.reply_text(reply[:4000])
 
 def start_telegram_polling():
-    if not TELEGRAM_READY:
-        log("INFO", "Telegram: OFF (missing token or PTB)")
+    global telegram_app
+    if not TELEGRAM_ENABLED or not TELEGRAM_BOT_TOKEN:
+        log("INFO", "Telegram disabled or token missing; skipping bot start.")
         return
 
-    async def _run():
-        try:
-            app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-            app.add_handler(CommandHandler("start", tg_start))
-            app.add_handler(CommandHandler("help", tg_help))
-            app.add_handler(CommandHandler("ask", tg_ask))
-            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, tg_help))
-            log("INFO", "Telegram handlers registered. Mode: POLLING")
-            db_log("telegram", "INFO", "handlers registered", {})
-            await app.run_polling(close_loop=False)  # single call; await properly
-        except Exception as e:
-            db_log("telegram", "ERROR", "polling crashed", {"err": str(e), "trace": traceback.format_exc()})
+    try:
+        telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        telegram_app.add_handler(CommandHandler("start", tg_cmd_start))
+        telegram_app.add_handler(CommandHandler("help", tg_cmd_help))
+        telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, tg_on_text))
 
-    # run in a dedicated thread with its own event loop
-    def thread_target():
-        try:
-            asyncio.run(_run())
-        except Exception as e:
-            db_log("telegram", "ERROR", "thread crash", {"err": str(e)})
+        def runner():
+            try:
+                log("INFO", "Telegram handlers registered. Mode: POLLING")
+                db_log("telegram", "INFO", "polling_start", {})
+                # run_polling is a blocking convenience method (v21) – NOT a coroutine.
+                telegram_app.run_polling(close_loop=False, allowed_updates=Update.ALL_TYPES)
+            except Exception as e:
+                db_log("telegram", "ERROR", "polling crashed", {"err": str(e), "trace": traceback.format_exc()})
+                log("ERROR", "telegram polling crashed", err=str(e))
+        th = threading.Thread(target=runner, daemon=True)
+        th.start()
+        return th
+    except Exception as e:
+        db_log("telegram", "ERROR", "init_failed", {"err": str(e), "trace": traceback.format_exc()})
+        log("ERROR", "Telegram init failed", err=str(e))
 
-    t = threading.Thread(target=thread_target, daemon=True)
-    t.start()
+# ─────────────────────────────────────────────────────────────────────────────
+# APP STARTUP
+# ─────────────────────────────────────────────────────────────────────────────
+def startup():
+    db_init()
+    log("INFO", "App:", APP_NAME)
+    log("INFO", "Public URL:", PUBLIC_URL)
+    log("INFO", "Brand Page:", BRAND_PAGE)
+    log("INFO", "OpenAI:", "ON" if oai else "OFF", model=OPENAI_MODEL)
+    log("INFO", "Telegram:", "ON" if TELEGRAM_ENABLED else "OFF")
+    if TELEGRAM_ENABLED and TELEGRAM_BOT_TOKEN:
+        global telegram_thread
+        telegram_thread = start_telegram_polling()
 
-# =============== Startup Logs ===============
-def print_boot_banner():
-    log("INFO", "OpenAI client initialized." if USE_OPENAI else "OpenAI disabled.")
-    log("INFO", f"App: {APP_NAME}")
-    log("INFO", f"Public URL: {PUBLIC_URL}")
-    log("INFO", f"Brand Page: {BRAND_URL}")
-    log("INFO", f"OpenAI: {'ON' if USE_OPENAI else 'OFF'} ({OPENAI_MODEL})")
-    log("INFO", f"HF Proxy: {'ON' if HF_PROXY else 'OFF'}")
-    log("INFO", f"Telegram: {'ON' if TELEGRAM_READY else 'OFF'}; Polling: {TELEGRAM_POLLING}")
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN (Gunicorn will import `app`; local run uses flask dev server)
+# ─────────────────────────────────────────────────────────────────────────────
+startup()
 
-# =============== Main ===============
 if __name__ == "__main__":
-    print_boot_banner()
-    # start scheduler
-    start_scheduler_thread()
-
-    # start telegram polling in background (fixed: no 'never awaited' now)
-    if TELEGRAM_POLLING:
-        start_telegram_polling()
-
-    # serve Flask
-    # Render binds to PORT env; dev run is fine too
-    app.run(host=HOST, port=PORT, debug=False)
+    # Dev server only (Render uses gunicorn via Procfile)
+    log("INFO", "Starting Flask dev server…", port=PORT)
+    app.run(host="0.0.0.0", port=PORT)
