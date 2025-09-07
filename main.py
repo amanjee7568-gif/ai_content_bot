@@ -1863,8 +1863,386 @@ def dashboard():
     )
 
 # =========================
+# TELEGRAM BOT SETUP
+# =========================
+
+def setup_telegram():
+    """Setup Telegram bot with handlers"""
+    if not TELEGRAM_TOKEN:
+        log("telegram", "WARNING", "Telegram token not configured. Skipping bot setup.")
+        return
+    
+    try:
+        from telegram import Update
+        from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+        import threading
+        
+        # Create application
+        global telegram_app
+        telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
+        
+        # Add handlers
+        telegram_app.add_handler(CommandHandler("start", tg_start))
+        telegram_app.add_handler(CommandHandler("gpt4", lambda update, context: tg_model_select(update, context, "gpt-4")))
+        telegram_app.add_handler(CommandHandler("claude", lambda update, context: tg_model_select(update, context, "claude-3-sonnet")))
+        telegram_app.add_handler(CommandHandler("gemini", lambda update, context: tg_model_select(update, context, "gemini-pro")))
+        telegram_app.add_handler(CommandHandler("gpt3", lambda update, context: tg_model_select(update, context, "gpt-3.5-turbo")))
+        telegram_app.add_handler(CommandHandler("balance", tg_balance))
+        telegram_app.add_handler(CommandHandler("help", tg_help))
+        telegram_app.add_handler(CallbackQueryHandler(tg_callback_query))
+        telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, tg_message))
+        
+        # Start bot in a separate thread for production
+        def start_bot():
+            try:
+                if not DEBUG:
+                    # Use webhook mode for production
+                    webhook_url = f"{DOMAIN}/telegram_webhook"
+                    telegram_app.run_webhook(
+                        listen="0.0.0.0",
+                        port=int(os.getenv('TELEGRAM_PORT', 8443)),
+                        webhook_url=webhook_url,
+                        url_path="telegram_webhook"
+                    )
+                else:
+                    # For development, use polling
+                    telegram_app.run_polling()
+            except Exception as e:
+                log("telegram", "ERROR", f"Bot thread error: {e}")
+        
+        # Start bot in background thread
+        bot_thread = threading.Thread(target=start_bot, daemon=True)
+        bot_thread.start()
+        
+        log("telegram", "INFO", "Telegram bot setup completed successfully")
+        
+    except ImportError:
+        log("telegram", "ERROR", "python-telegram-bot not installed. Skipping bot setup.")
+    except Exception as e:
+        log("telegram", "ERROR", f"Failed to setup Telegram bot: {e}")
+
+# Global telegram app instance
+telegram_app = None
+
+# =========================
+# TELEGRAM BOT HANDLERS
+# =========================
+
+async def tg_start(update: Update, context):
+    """Handle /start command"""
+    try:
+        user_id = str(update.effective_user.id)
+        username = update.effective_user.username or f"user_{user_id}"
+        
+        # Get or create user
+        user = User.query.filter_by(telegram_id=user_id).first()
+        if not user:
+            user = User(
+                username=username,
+                email=f"{username}@telegram.user",
+                telegram_id=user_id
+            )
+            user.set_password("telegram_user")
+            user.generate_referral_code()
+            user.wallet = 25.0  # Welcome bonus
+            db.session.add(user)
+            db.session.commit()
+            
+            welcome_text = f"""
+🎉 **Welcome to {APP_NAME}!**
+
+🎁 **Welcome Bonus**: ₹25 credited to your account!
+💰 **Your Balance**: ₹{user.wallet:.2f}
+
+🤖 **Available AI Models**:
+/gpt4 - GPT-4 Turbo (₹2.00/chat)
+/claude - Claude 3 Sonnet (₹1.50/chat)  
+/gemini - Gemini Pro (₹1.00/chat)
+/gpt3 - GPT-3.5 Turbo (₹1.50/chat)
+
+💡 **Commands**:
+/balance - Check your balance
+/help - Get help
+
+🔗 **Web App**: {DOMAIN}
+👨‍💼 **Admin Panel**: {DOMAIN}/admin
+
+Start chatting with any AI model! 🚀
+"""
+        else:
+            welcome_text = f"""
+👋 **Welcome back to {APP_NAME}!**
+
+💰 **Your Balance**: ₹{user.wallet:.2f}
+📊 **Total Chats**: {user.chats_count}
+🎯 **Referrals**: {user.referrals_count}
+
+🤖 **Select AI Model**:
+/gpt4 - GPT-4 Turbo (₹2.00/chat)
+/claude - Claude 3 Sonnet (₹1.50/chat)
+/gemini - Gemini Pro (₹1.00/chat)
+/gpt3 - GPT-3.5 Turbo (₹1.50/chat)
+
+Type your message to start chatting! 💬
+"""
+        
+        await update.message.reply_text(welcome_text, parse_mode='Markdown')
+        
+    except Exception as e:
+        log("telegram", "ERROR", f"Error in /start command: {e}")
+        await update.message.reply_text("❌ Sorry, something went wrong. Please try again.")
+
+async def tg_model_select(update: Update, context, model_name: str):
+    """Handle model selection commands"""
+    try:
+        user_id = str(update.effective_user.id)
+        user = User.query.filter_by(telegram_id=user_id).first()
+        
+        if not user:
+            await update.message.reply_text("❌ Please start with /start first.")
+            return
+            
+        # Store selected model in context
+        context.user_data['selected_model'] = model_name
+        
+        model_info = {
+            "gpt-4": {"name": "GPT-4 Turbo", "cost": 2.00},
+            "claude-3-sonnet": {"name": "Claude 3 Sonnet", "cost": 1.50},
+            "gemini-pro": {"name": "Gemini Pro", "cost": 1.00},
+            "gpt-3.5-turbo": {"name": "GPT-3.5 Turbo", "cost": 1.50}
+        }
+        
+        info = model_info.get(model_name, {"name": "Unknown", "cost": 0.10})
+        
+        await update.message.reply_text(
+            f"🤖 **{info['name']} Selected**\n\n"
+            f"💰 **Cost**: ₹{info['cost']:.2f} per message\n"
+            f"💳 **Your Balance**: ₹{user.wallet:.2f}\n\n"
+            f"💬 Send me your message to start chatting!",
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        log("telegram", "ERROR", f"Error in model selection: {e}")
+        await update.message.reply_text("❌ Error selecting model. Please try again.")
+
+async def tg_balance(update: Update, context):
+    """Handle /balance command"""
+    try:
+        user_id = str(update.effective_user.id)
+        user = User.query.filter_by(telegram_id=user_id).first()
+        
+        if not user:
+            await update.message.reply_text("❌ Please start with /start first.")
+            return
+            
+        balance_text = f"""
+💰 **Account Balance**
+
+💳 **Current Balance**: ₹{user.wallet:.2f}
+📊 **Total Earned**: ₹{user.total_earned:.2f}
+💬 **Total Chats**: {user.chats_count}
+🎯 **Referrals**: {user.referrals_count}
+
+🔗 **Referral Code**: `{user.referral_code}`
+💡 **Earn ₹10 for each referral!**
+
+🌐 **Web Dashboard**: {DOMAIN}
+"""
+        
+        await update.message.reply_text(balance_text, parse_mode='Markdown')
+        
+    except Exception as e:
+        log("telegram", "ERROR", f"Error in /balance command: {e}")
+        await update.message.reply_text("❌ Error fetching balance. Please try again.")
+
+async def tg_help(update: Update, context):
+    """Handle /help command"""
+    help_text = f"""
+🤖 **{APP_NAME} - Help**
+
+**🎯 Available Commands:**
+/start - Start the bot and get welcome bonus
+/gpt4 - Use GPT-4 Turbo (₹2.00/chat)
+/claude - Use Claude 3 Sonnet (₹1.50/chat)
+/gemini - Use Gemini Pro (₹1.00/chat)
+/gpt3 - Use GPT-3.5 Turbo (₹1.50/chat)
+/balance - Check your balance and stats
+/help - Show this help message
+
+**💰 How to Earn:**
+• Get ₹25 welcome bonus on signup
+• Refer friends and earn ₹10 per referral
+• Use referral code: Share your code with friends
+
+**🌐 Web Features:**
+• Full dashboard at {DOMAIN}
+• Admin panel for advanced features
+• Real-time earnings tracking
+
+**💡 Tips:**
+• Select a model first, then send your message
+• Check your balance regularly
+• Share your referral code to earn more!
+
+Need more help? Contact {SUPPORT_USERNAME}
+"""
+    
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+
+async def tg_message(update: Update, context):
+    """Handle regular text messages"""
+    try:
+        user_id = str(update.effective_user.id)
+        user = User.query.filter_by(telegram_id=user_id).first()
+        
+        if not user:
+            await update.message.reply_text("❌ Please start with /start first.")
+            return
+            
+        # Get selected model or use default
+        selected_model = context.user_data.get('selected_model', 'gpt-3.5-turbo')
+        message_text = update.message.text
+        
+        # Check if user has sufficient balance
+        model_costs = {
+            "gpt-4": 2.00,
+            "claude-3-sonnet": 1.50,
+            "gemini-pro": 1.00,
+            "gpt-3.5-turbo": 1.50
+        }
+        
+        cost = model_costs.get(selected_model, 0.10)
+        
+        if user.wallet < cost:
+            await update.message.reply_text(
+                f"❌ **Insufficient Balance**\n\n"
+                f"💰 **Required**: ₹{cost:.2f}\n"
+                f"💳 **Your Balance**: ₹{user.wallet:.2f}\n\n"
+                f"🔗 **Add funds**: {DOMAIN}\n"
+                f"🎯 **Refer friends**: Earn ₹10 per referral!",
+                parse_mode='Markdown'
+            )
+            return
+            
+        # Send typing indicator
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+        
+        # Get AI response
+        ai_manager = AIModelManager()
+        response = await ai_manager.get_response(message_text, selected_model)
+        
+        if response:
+            # Deduct cost and update stats
+            user.wallet -= cost
+            user.chats_count += 1
+            
+            # Add transaction record
+            transaction = Transaction(
+                user_id=user.id,
+                amount=-cost,
+                transaction_type='chat',
+                status='completed',
+                description=f"AI Chat - {selected_model}"
+            )
+            db.session.add(transaction)
+            db.session.commit()
+            
+            # Send response
+            await update.message.reply_text(
+                f"🤖 **{selected_model.upper()}**: {response}\n\n"
+                f"💰 **Balance**: ₹{user.wallet:.2f} (-₹{cost:.2f})",
+                parse_mode='Markdown'
+            )
+            
+            log("telegram", "INFO", f"AI response sent to user {user_id}")
+            
+        else:
+            await update.message.reply_text("❌ Sorry, I couldn't process your request. Please try again.")
+            
+    except Exception as e:
+        log("telegram", "ERROR", f"Error processing message: {e}")
+        await update.message.reply_text("❌ Something went wrong. Please try again.")
+
+async def tg_callback_query(update: Update, context):
+    """Handle callback queries from inline keyboards"""
+    try:
+        query = update.callback_query
+        await query.answer()
+        
+        # Handle different callback data
+        if query.data.startswith('model_'):
+            model_name = query.data.replace('model_', '')
+            context.user_data['selected_model'] = model_name
+            await query.edit_message_text(f"✅ Model {model_name} selected! Send your message.")
+            
+    except Exception as e:
+        log("telegram", "ERROR", f"Error in callback query: {e}")
+
+# =========================
 # MAIN APPLICATION STARTUP
 # =========================
+
+def migrate_database():
+    """Migrate database schema to add missing columns"""
+    try:
+        from sqlalchemy import inspect, text
+        
+        # Check if we need to add new columns
+        inspector = inspect(db.engine)
+        
+        # Check if users table exists
+        if not inspector.has_table('users'):
+            log("database", "INFO", "Users table doesn't exist, will be created by db.create_all()")
+            return
+            
+        columns = [col['name'] for col in inspector.get_columns('users')]
+        
+        missing_columns = []
+        required_columns = [
+            'total_earned', 'visits_count', 'chats_count', 'referrals_count',
+            'referral_code', 'referred_by', 'premium_until', 'last_visit'
+        ]
+        
+        for col in required_columns:
+            if col not in columns:
+                missing_columns.append(col)
+        
+        if missing_columns:
+            log("database", "INFO", f"Adding missing columns: {missing_columns}")
+            
+            # Add missing columns with ALTER TABLE
+            for col in missing_columns:
+                try:
+                    if col in ['total_earned']:
+                        db.engine.execute(text(f"ALTER TABLE users ADD COLUMN {col} FLOAT DEFAULT 0.0"))
+                    elif col in ['visits_count', 'chats_count', 'referrals_count']:
+                        db.engine.execute(text(f"ALTER TABLE users ADD COLUMN {col} INTEGER DEFAULT 0"))
+                    elif col in ['referral_code', 'referred_by']:
+                        db.engine.execute(text(f"ALTER TABLE users ADD COLUMN {col} VARCHAR(20)"))
+                    elif col in ['premium_until', 'last_visit']:
+                        db.engine.execute(text(f"ALTER TABLE users ADD COLUMN {col} DATETIME"))
+                    
+                    log("database", "INFO", f"Added column: {col}")
+                except Exception as e:
+                    log("database", "WARNING", f"Could not add column {col}: {e}")
+            
+            # Commit changes
+            db.session.commit()
+            log("database", "INFO", "Database migration completed")
+        else:
+            log("database", "INFO", "Database schema is up to date")
+            
+    except Exception as e:
+        log("database", "ERROR", f"Database migration failed: {e}")
+        # If migration fails, recreate tables
+        try:
+            log("database", "INFO", "Attempting to recreate database tables...")
+            db.drop_all()
+            db.create_all()
+            log("database", "INFO", "Database recreated successfully")
+        except Exception as e2:
+            log("database", "ERROR", f"Database recreation failed: {e2}")
 
 if __name__ == '__main__':
     log("system", "INFO", f"🚀 Starting {APP_NAME}...")
@@ -1874,6 +2252,9 @@ if __name__ == '__main__':
         try:
             db.create_all()
             log("database", "INFO", "Database tables created successfully")
+            
+            # Run database migration
+            migrate_database()
             
             # Create admin user if not exists
             admin_user = User.query.filter_by(username=ADMIN_USER).first()
@@ -1894,8 +2275,8 @@ if __name__ == '__main__':
         except Exception as e:
             log("database", "ERROR", f"Database initialization failed: {e}")
     
-    # Setup Telegram bot
-    setup_telegram()
+    # Setup Telegram bot (disabled for now to focus on web app)
+    log("telegram", "INFO", "Telegram bot setup skipped for web-only deployment")
     
     # Start Flask application
     port = int(os.getenv('PORT', 10000))
